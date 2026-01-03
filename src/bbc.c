@@ -3,6 +3,7 @@
 // ============================================ \\
 
 #include <stdio.h>
+#include <string.h>
 
 // Attack Tables
 
@@ -145,6 +146,12 @@ enum
     bq = 8
 };
 
+enum
+{
+    all_moves,
+    only_captures
+};
+
 // -------------------------------------------- \\
 //               GAME STATE GLOBALS             \\
 // -------------------------------------------- \\
@@ -163,6 +170,17 @@ U64 occupancies[3];
 int side;               // Current side to move (0=white, 1=black)
 int en_passant = no_sq; // En passant square (if available, else 'no_sq')
 int castle;             // Castling rights integer (e.g., 1111 in binary = 15)
+
+// Castling rights update constants
+const int castling_rights[64] = {
+    7, 15, 15, 15, 3, 15, 15, 11,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    13, 15, 15, 15, 12, 15, 15, 14};
 
 // -------------------------------------------- \\
 //             BITWISE MACROS                   \\
@@ -262,6 +280,28 @@ void print_move(int move)
         printf("q"); // Simplified placeholder
     }
 }
+
+// -------------------------------------------- \\
+//             BOARD MANIPULATION               \\
+// -------------------------------------------- \\
+
+// Macro to restore board state
+#define copy_board()                             \
+    U64 bitboards_copy[12], occupancies_copy[3]; \
+    int side_copy, en_passant_copy, castle_copy; \
+    memcpy(bitboards_copy, bitboards, 96);       \
+    memcpy(occupancies_copy, occupancies, 24);   \
+    side_copy = side;                            \
+    en_passant_copy = en_passant;                \
+    castle_copy = castle;
+
+// Macro to restore board state
+#define take_back()                            \
+    memcpy(bitboards, bitboards_copy, 96);     \
+    memcpy(occupancies, occupancies_copy, 24); \
+    side = side_copy;                          \
+    en_passant = en_passant_copy;              \
+    castle = castle_copy;
 
 // -------------------------------------------- \\
 //           BIT MANIPULATION HELPERS           \\
@@ -1365,6 +1405,240 @@ void generate_moves(moves *move_list)
     }
 }
 
+// Make move function
+// move: The encoded move integer
+// move_flag: 0 = all moves, 1 = only captures (for later)
+// Returns: 1 if legal, 0 if illegal (king left in check)
+int make_move(int move, int move_flag)
+{
+
+    // 1. Quiet Moves: If `move_flag` is capture-only, returns 0
+    if (move_flag == all_moves)
+    {
+        // (We will use this later for Quiescence Search)
+        // For now, just pass 0 or 'all_moves' enum
+    }
+    else
+    {
+        // If capture flag is 1, ensure the move is a capture
+        if (!get_move_capture(move))
+            return 0;
+    }
+
+    // 2. Copy Board State (Backup)
+    copy_board();
+
+    // 3. Parse Move Info
+    int source_square = get_move_source(move);
+    int target_square = get_move_target(move);
+    int piece = get_move_piece(move);
+    int promoted_piece = get_move_promoted(move);
+    int capture = get_move_capture(move);
+    int double_push = get_move_double(move);
+    int enpass = get_move_enpassant(move);
+    int castling = get_move_castling(move);
+
+    // 4. Handle Movement (Bit Manipulation)
+    // Remove piece from source
+    pop_bit(bitboards[piece], source_square);
+    // Add piece to target
+    set_bit(bitboards[piece], target_square);
+
+    // 5. Handle Captures
+    if (capture)
+    {
+        // Find which piece we just captured based on target square
+        // Loop through enemy pieces (start_piece to end_piece)
+        int start_piece, end_piece;
+
+        if (side == white)
+        {
+            start_piece = p;
+            end_piece = k;
+        }
+        else
+        {
+            start_piece = P;
+            end_piece = K;
+        }
+
+        // Loop and remove the captured piece
+        for (int bb_piece = start_piece; bb_piece <= end_piece; bb_piece++)
+        {
+            if (get_bit(bitboards[bb_piece], target_square))
+            {
+                pop_bit(bitboards[bb_piece], target_square);
+                break;
+            }
+        }
+    }
+
+    // 6. Handle Promotions
+    if (promoted_piece)
+    {
+        // Remove the pawn we just placed on rank 8
+        pop_bit(bitboards[(side == white) ? P : p], target_square);
+        // Place the new promoted piece
+        set_bit(bitboards[promoted_piece], target_square);
+    }
+
+    // 7. Handle En Passant
+    if (enpass)
+    {
+        // If White captures En Passant, remove Black pawn south of target
+        if (side == white)
+        {
+            pop_bit(bitboards[p], target_square + 8);
+        }
+        // If Black captures En Passant, remove White pawn north of target
+        else
+        {
+            pop_bit(bitboards[P], target_square - 8);
+        }
+    }
+
+    // 8. Reset En Passant Square
+    // Usually we reset it every move, unless a double push sets a new one
+    en_passant = no_sq;
+
+    // 9. Handle Double Push (Set En Passant Square)
+    if (double_push)
+    {
+        if (side == white)
+            en_passant = target_square + 8;
+        else
+            en_passant = target_square - 8;
+    }
+
+    // 10. Handle Castling
+    if (castling)
+    {
+        switch (target_square)
+        {
+        // White King Side
+        case g1:
+            pop_bit(bitboards[R], h1);
+            set_bit(bitboards[R], f1);
+            break;
+        // White Queen Side
+        case c1:
+            pop_bit(bitboards[R], a1);
+            set_bit(bitboards[R], d1);
+            break;
+        // Black King Side
+        case g8:
+            pop_bit(bitboards[r], h8);
+            set_bit(bitboards[r], f8);
+            break;
+        // Black Queen Side
+        case c8:
+            pop_bit(bitboards[r], a8);
+            set_bit(bitboards[r], d8);
+            break;
+        }
+    }
+
+    // 11. Update Castling Rights
+    // If King or Rook moves/captured, rights are lost.
+    // We update this by ANDing the current rights with a pre-calculated table.
+    // simpler logic:
+    castle &= castling_rights[source_square];
+    castle &= castling_rights[target_square];
+
+    // 12. Update Occupancies
+    // Clear all
+    for (int i = 0; i < 3; i++)
+        occupancies[i] = 0ULL;
+    // Rebuild
+    for (int bb_piece = P; bb_piece <= K; bb_piece++)
+        occupancies[white] |= bitboards[bb_piece];
+    for (int bb_piece = p; bb_piece <= k; bb_piece++)
+        occupancies[black] |= bitboards[bb_piece];
+    occupancies[both] = occupancies[white] | occupancies[black];
+
+    // 13. Change Side
+    side ^= 1;
+
+    // 14. CHECK FOR LEGALITY
+    // If the King is in check after the move, it was illegal.
+    if (is_square_attacked((side == white) ? get_ls1b_index(bitboards[k]) : get_ls1b_index(bitboards[K]), side))
+    {
+        // Move is illegal, take it back
+        take_back();
+        return 0;
+    }
+    else
+    {
+        // Move is legal
+        return 1;
+    }
+}
+
+// -------------------------------------------- \\
+//                PERFORMANCE TEST              \\
+// -------------------------------------------- \\
+
+// Leaf nodes count
+long nodes;
+
+// Perft driver
+static inline void perft_driver(int depth)
+{
+    if (depth == 0)
+    {
+        nodes++;
+        return;
+    }
+
+    moves move_list[1];
+    generate_moves(move_list);
+
+    for (int count = 0; count < move_list->count; count++)
+    {
+        copy_board();
+
+        if (!make_move(move_list->moves[count], all_moves))
+        {
+            continue;
+        }
+
+        perft_driver(depth - 1);
+        take_back();
+    }
+}
+
+// Perft test (Top level)
+void perft_test(int depth)
+{
+    nodes = 0LL;
+    printf("\n  Performance test\n\n");
+
+    moves move_list[1];
+    generate_moves(move_list);
+
+    for (int count = 0; count < move_list->count; count++)
+    {
+        copy_board();
+
+        if (!make_move(move_list->moves[count], all_moves))
+        {
+            continue;
+        }
+
+        long cumulative_nodes = nodes;
+        perft_driver(depth - 1);
+        take_back();
+
+        long old_nodes = nodes - cumulative_nodes;
+        printf("  move: %d  ", count + 1);
+        print_move(move_list->moves[count]);
+        printf("  nodes: %ld\n", old_nodes);
+    }
+
+    printf("\n  Depth: %d\n", depth);
+    printf("  Nodes: %ld\n", nodes);
+}
+
 // -------------------------------------------- \\
 //                MAIN DRIVER                   \\
 // -------------------------------------------- \\
@@ -1377,28 +1651,15 @@ char *tricky_position = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R
 
 int main()
 {
-
-    // 1. Init
     init_leapers_attacks();
     init_sliders_attacks(0);
     init_sliders_attacks(1);
 
-    // 2. Parse Position
     parse_fen(tricky_position);
     print_board();
 
-    // 3. Generate Moves
-    moves move_list[1];
-    generate_moves(move_list);
-
-    // 4. Print Generated Moves
-    printf("Generated Moves: %d\n", move_list->count);
-    for (int i = 0; i < move_list->count; i++)
-    {
-        print_move(move_list->moves[i]);
-        printf(" ");
-    }
-    printf("\n\n");
+    // The moment of truth
+    perft_test(5);
 
     return 0;
 }
