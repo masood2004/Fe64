@@ -457,21 +457,25 @@ int score_move(int move)
 {
     if (get_move_capture(move))
     {
-        int target_piece = P; // Placeholder: you must find what's on the target square
-        int start_piece = (side == white) ? p : P;
-        int end_piece = (side == white) ? k : K;
+        int target_square = get_move_target(move);
+        int victim = P; // Default
 
-        for (int bb_piece = start_piece; bb_piece <= end_piece; bb_piece++)
+        // Determine the victim piece
+        int start = (side == white) ? p : P;
+        int end = (side == white) ? k : K;
+        for (int p = start; p <= end; p++)
         {
-            if (get_bit(bitboards[bb_piece], get_move_target(move)))
+            if (get_bit(bitboards[p], target_square))
             {
-                target_piece = bb_piece;
+                victim = p;
                 break;
             }
         }
-        return mvv_lva[get_move_piece(move)][target_piece] + 10000;
+
+        // MVV-LVA formula
+        return mvv_lva[get_move_piece(move)][victim] + 10000;
     }
-    return 0; // Quiet moves get 0 for now
+    return 0;
 }
 
 // -------------------------------------------- \\
@@ -1631,6 +1635,11 @@ int make_move(int move, int move_flag)
     int enpass = get_move_enpassant(move);
     int castling = get_move_castling(move);
 
+    // Update hash: remove piece from source
+    hash_key ^= piece_keys[piece][source_square];
+    // Update hash: add piece to target
+    hash_key ^= piece_keys[piece][target_square];
+
     // 4. Handle Movement (Bit Manipulation)
     // Remove piece from source
     pop_bit(bitboards[piece], source_square);
@@ -1663,6 +1672,8 @@ int make_move(int move, int move_flag)
                 pop_bit(bitboards[bb_piece], target_square);
                 break;
             }
+            // Update hash: remove captured piece
+            hash_key ^= piece_keys[bb_piece][target_square];
         }
     }
 
@@ -1751,6 +1762,7 @@ int make_move(int move, int move_flag)
 
     // 13. Change Side
     side ^= 1;
+    hash_key ^= side_key;
 
     // 14. CHECK FOR LEGALITY
     // If the King is in check after the move, it was illegal.
@@ -1877,6 +1889,12 @@ int quiescence(int alpha, int beta)
 // Negamax with Alpha-Beta Pruning
 int negamax(int alpha, int beta, int depth)
 {
+
+    // 1. Check Transposition Table
+    int score = read_tt(alpha, beta, depth);
+    if (score != -INF)
+        return score;
+
     if (depth == 0)
         return quiescence(alpha, beta);
 
@@ -1884,6 +1902,8 @@ int negamax(int alpha, int beta, int depth)
     generate_moves(move_list);
     int old_alpha = alpha;
     int moves_searched = 0;
+    int best_so_far = -INF;
+    int move_to_store = 0;
 
     for (int count = 0; count < move_list->count; count++)
     {
@@ -1905,8 +1925,17 @@ int negamax(int alpha, int beta, int depth)
         int score = -negamax(-beta, -alpha, depth - 1);
         take_back();
 
+        if (score > best_so_far)
+        {
+            best_so_far = score;
+            move_to_store = move_list->moves[count];
+        }
+
         if (score >= beta)
-            return beta; // Fail high
+        { // Store fail-high (Beta)
+            write_tt(depth, beta, HASH_BETA, move_list->moves[count]);
+            return beta;
+        }
         if (score > alpha)
         {
             alpha = score;
@@ -1922,6 +1951,10 @@ int negamax(int alpha, int beta, int depth)
         else
             return 0; // Stalemate
     }
+
+    // Store exact or alpha value
+    int flag = (alpha > old_alpha) ? HASH_EXACT : HASH_ALPHA;
+    write_tt(depth, alpha, flag, move_to_store);
 
     return alpha;
 }
