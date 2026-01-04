@@ -32,6 +32,12 @@ U64 bishop_masks[64];
 U64 rook_attacks_table[64][4096];
 U64 bishop_attacks_table[64][512];
 
+// Search Constants
+#define INF 50000
+#define MATE 49000
+
+int best_move;
+
 // -------------------------------------------- \\
 //              BOARD MAPPING                   \\
 // -------------------------------------------- \\
@@ -151,6 +157,104 @@ enum
     all_moves,
     only_captures
 };
+
+// -------------------------------------------- \\
+//               ZOBRIST HASHING                \\
+// -------------------------------------------- \\
+
+// Zobrist keys
+U64 piece_keys[12][64];
+U64 side_key;
+U64 castle_keys[16];
+U64 enpassant_keys[64];
+
+// Current hash key
+U64 hash_key;
+
+// Initialize random keys
+void init_hash_keys()
+{
+    random_state = 1804289383; // Reset RNG for consistency
+    for (int p = P; p <= k; p++)
+        for (int s = 0; s < 64; s++)
+            piece_keys[p][s] = get_random_U64_number();
+    side_key = get_random_U64_number();
+    for (int i = 0; i < 16; i++)
+        castle_keys[i] = get_random_U64_number();
+    for (int i = 0; i < 64; i++)
+        enpassant_keys[i] = get_random_U64_number();
+}
+
+// Generate full hash key from scratch
+U64 generate_hash_key()
+{
+    U64 final_key = 0ULL;
+    for (int p = P; p <= k; p++)
+    {
+        U64 bitboard = bitboards[p];
+        while (bitboard)
+        {
+            final_key ^= piece_keys[p][get_ls1b_index(bitboard)];
+            pop_bit(bitboard, get_ls1b_index(bitboard));
+        }
+    }
+    if (side == black)
+        final_key ^= side_key;
+    if (en_passant != no_sq)
+        final_key ^= enpassant_keys[en_passant];
+    final_key ^= castle_keys[castle];
+    return final_key;
+}
+
+// TT flags
+#define HASH_EXACT 0
+#define HASH_ALPHA 1
+#define HASH_BETA 2
+
+typedef struct
+{
+    U64 key;   // Unique position identifier
+    int depth; // Search depth
+    int flags; // Node type (Exact, Alpha, Beta)
+    int value; // Score
+    int best_move;
+} tt_entry;
+
+#define TT_SIZE 0x400000 // ~4 million entries (approx 100MB)
+tt_entry transposition_table[TT_SIZE];
+
+void clear_tt()
+{
+    memset(transposition_table, 0, sizeof(transposition_table));
+}
+
+int read_tt(int alpha, int beta, int depth)
+{
+    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
+    if (entry->key == hash_key)
+    {
+        if (entry->depth >= depth)
+        {
+            if (entry->flags == HASH_EXACT)
+                return entry->value;
+            if (entry->flags == HASH_ALPHA && entry->value <= alpha)
+                return alpha;
+            if (entry->flags == HASH_BETA && entry->value >= beta)
+                return beta;
+        }
+    }
+    return -INF;
+}
+
+void write_tt(int depth, int value, int flags, int move)
+{
+    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
+    entry->key = hash_key;
+    entry->depth = depth;
+    entry->flags = flags;
+    entry->value = value;
+    entry->best_move = move;
+}
 
 // -------------------------------------------- \\
 //               GAME STATE GLOBALS             \\
@@ -336,6 +440,38 @@ void print_move(int move)
         // For simplicity assume lower case chars:
         printf("q"); // Simplified placeholder
     }
+}
+
+// MVV (Most Valuable Victim) LVA (Least Valuable Attacker) [attacker][victim]
+static int mvv_lva[12][12] = {
+    {105, 205, 305, 405, 505, 605, 105, 205, 305, 405, 505, 605},
+    {104, 204, 304, 404, 504, 604, 104, 204, 304, 404, 504, 604},
+    {103, 203, 303, 403, 503, 603, 103, 203, 303, 403, 503, 603},
+    {102, 202, 302, 402, 502, 602, 102, 202, 302, 402, 502, 602},
+    {101, 201, 301, 401, 501, 601, 101, 201, 301, 401, 501, 601},
+    {100, 200, 300, 400, 500, 600, 100, 200, 300, 400, 500, 600},
+    // Mirror for black attackers...
+};
+
+int score_move(int move)
+{
+    if (get_move_capture(move))
+    {
+        int target_piece = P; // Placeholder: you must find what's on the target square
+        int start_piece = (side == white) ? p : P;
+        int end_piece = (side == white) ? k : K;
+
+        for (int bb_piece = start_piece; bb_piece <= end_piece; bb_piece++)
+        {
+            if (get_bit(bitboards[bb_piece], get_move_target(move)))
+            {
+                target_piece = bb_piece;
+                break;
+            }
+        }
+        return mvv_lva[get_move_piece(move)][target_piece] + 10000;
+    }
+    return 0; // Quiet moves get 0 for now
 }
 
 // -------------------------------------------- \\
@@ -1699,17 +1835,50 @@ int evaluate()
     return (side == white) ? score : -score;
 }
 
-// Search Constants
-#define INF 50000
-#define MATE 49000
+int quiescence(int alpha, int beta)
+{
+    int stand_pat = evaluate();
+    if (stand_pat >= beta)
+        return beta;
+    if (alpha < stand_pat)
+        alpha = stand_pat;
 
-int best_move;
+    moves move_list[1];
+    generate_moves(move_list); // You should modify generate_moves to only produce captures here
+
+    for (int count = 0; count < move_list->count; count++)
+    {
+        if (!get_move_capture(move_list->moves[count]))
+            continue;
+        // Move sorting logic (Selection Sort)
+        for (int next = count + 1; next < move_list->count; next++)
+        {
+            if (score_move(move_list->moves[count]) < score_move(move_list->moves[next]))
+            {
+                int temp = move_list->moves[count];
+                move_list->moves[count] = move_list->moves[next];
+                move_list->moves[next] = temp;
+            }
+        }
+        copy_board();
+        if (!make_move(move_list->moves[count], only_captures))
+            continue;
+        int score = -quiescence(-beta, -alpha);
+        take_back();
+
+        if (score >= beta)
+            return beta;
+        if (score > alpha)
+            alpha = score;
+    }
+    return alpha;
+}
 
 // Negamax with Alpha-Beta Pruning
 int negamax(int alpha, int beta, int depth)
 {
     if (depth == 0)
-        return evaluate();
+        return quiescence(alpha, beta);
 
     moves move_list[1];
     generate_moves(move_list);
@@ -1718,6 +1887,16 @@ int negamax(int alpha, int beta, int depth)
 
     for (int count = 0; count < move_list->count; count++)
     {
+        // Move sorting logic (Selection Sort)
+        for (int next = count + 1; next < move_list->count; next++)
+        {
+            if (score_move(move_list->moves[count]) < score_move(move_list->moves[next]))
+            {
+                int temp = move_list->moves[count];
+                move_list->moves[count] = move_list->moves[next];
+                move_list->moves[next] = temp;
+            }
+        }
         copy_board();
         if (!make_move(move_list->moves[count], all_moves))
             continue;
@@ -1852,8 +2031,17 @@ void uci_loop()
         // Handle go command (start searching)
         else if (strncmp(input, "go", 2) == 0)
         {
-            // Search to depth 6 and output best move
-            int score = negamax(-INF, INF, 6);
+            // Iterative Deepening
+            for (int depth = 1; depth <= 10; depth++)
+            {
+                search_depth = depth;
+                int score = negamax(-INF, INF, depth);
+
+                // Output info for the GUI
+                printf("info depth %d score cp %d pv ", depth, score);
+                print_move(best_move);
+                printf("\n");
+            }
             printf("bestmove ");
             print_move(best_move);
             printf("\n");
