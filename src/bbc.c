@@ -4,12 +4,27 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 // Attack Tables
 
 // -------------------------------------------- \\
 //               DATA TYPES                     \\
 // -------------------------------------------- \\
+
+// Move List Structure
+typedef struct
+{
+    int moves[256];
+    int count;
+} moves;
+
+// Forward Declarations
+void generate_moves(moves *move_list);
+int make_move(int move, int move_flag);
+void print_board();
+void parse_fen(char *fen);
+int parse_move(char *move_string);
 
 // The 64-bit integer is the heart of the engine.
 // We use 'unsigned' because we don't need negative numbers.
@@ -159,106 +174,11 @@ enum
 };
 
 // -------------------------------------------- \\
-//               ZOBRIST HASHING                \\
-// -------------------------------------------- \\
-
-// Zobrist keys
-U64 piece_keys[12][64];
-U64 side_key;
-U64 castle_keys[16];
-U64 enpassant_keys[64];
-
-// Current hash key
-U64 hash_key;
-
-// Initialize random keys
-void init_hash_keys()
-{
-    random_state = 1804289383; // Reset RNG for consistency
-    for (int p = P; p <= k; p++)
-        for (int s = 0; s < 64; s++)
-            piece_keys[p][s] = get_random_U64_number();
-    side_key = get_random_U64_number();
-    for (int i = 0; i < 16; i++)
-        castle_keys[i] = get_random_U64_number();
-    for (int i = 0; i < 64; i++)
-        enpassant_keys[i] = get_random_U64_number();
-}
-
-// Generate full hash key from scratch
-U64 generate_hash_key()
-{
-    U64 final_key = 0ULL;
-    for (int p = P; p <= k; p++)
-    {
-        U64 bitboard = bitboards[p];
-        while (bitboard)
-        {
-            final_key ^= piece_keys[p][get_ls1b_index(bitboard)];
-            pop_bit(bitboard, get_ls1b_index(bitboard));
-        }
-    }
-    if (side == black)
-        final_key ^= side_key;
-    if (en_passant != no_sq)
-        final_key ^= enpassant_keys[en_passant];
-    final_key ^= castle_keys[castle];
-    return final_key;
-}
-
-// TT flags
-#define HASH_EXACT 0
-#define HASH_ALPHA 1
-#define HASH_BETA 2
-
-typedef struct
-{
-    U64 key;   // Unique position identifier
-    int depth; // Search depth
-    int flags; // Node type (Exact, Alpha, Beta)
-    int value; // Score
-    int best_move;
-} tt_entry;
-
-#define TT_SIZE 0x400000 // ~4 million entries (approx 100MB)
-tt_entry transposition_table[TT_SIZE];
-
-void clear_tt()
-{
-    memset(transposition_table, 0, sizeof(transposition_table));
-}
-
-int read_tt(int alpha, int beta, int depth)
-{
-    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
-    if (entry->key == hash_key)
-    {
-        if (entry->depth >= depth)
-        {
-            if (entry->flags == HASH_EXACT)
-                return entry->value;
-            if (entry->flags == HASH_ALPHA && entry->value <= alpha)
-                return alpha;
-            if (entry->flags == HASH_BETA && entry->value >= beta)
-                return beta;
-        }
-    }
-    return -INF;
-}
-
-void write_tt(int depth, int value, int flags, int move)
-{
-    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
-    entry->key = hash_key;
-    entry->depth = depth;
-    entry->flags = flags;
-    entry->value = value;
-    entry->best_move = move;
-}
-
-// -------------------------------------------- \\
 //               GAME STATE GLOBALS             \\
 // -------------------------------------------- \\
+
+// START POSITION FEN
+char *start_position = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
 // Piece Bitboards
 // We use an array of 12 bitboards (one for each piece type: P, N, B, R, Q, K, p, n, b, r, q, k)
@@ -277,6 +197,12 @@ int castle;             // Castling rights integer (e.g., 1111 in binary = 15)
 
 // Search Depth
 int search_depth;
+
+// Killer moves [id][ply]
+int killer_moves[2][64];
+
+// History moves [piece][square]
+int history_moves[12][64];
 
 // Castling rights update constants
 const int castling_rights[64] = {
@@ -409,13 +335,6 @@ const int king_score[64] = {
 #define get_move_enpassant(move) (move & 0x400000)
 #define get_move_castling(move) (move & 0x800000)
 
-// Move List Structure
-typedef struct
-{
-    int moves[256];
-    int count;
-} moves;
-
 // Helper to add a move to the list
 void add_move(moves *move_list, int move)
 {
@@ -436,9 +355,31 @@ void print_move(int move)
     int promoted = get_move_promoted(move);
     if (promoted)
     {
-        // q=4 (from enum P,N,B,R,Q), but usually we map specific promoted pieces
-        // For simplicity assume lower case chars:
-        printf("q"); // Simplified placeholder
+        // Map promoted piece to character
+        char promo_char;
+        switch (promoted)
+        {
+        case Q:
+        case q:
+            promo_char = 'q';
+            break;
+        case R:
+        case r:
+            promo_char = 'r';
+            break;
+        case B:
+        case b:
+            promo_char = 'b';
+            break;
+        case N:
+        case n:
+            promo_char = 'n';
+            break;
+        default:
+            promo_char = 'q';
+            break;
+        }
+        printf("%c", promo_char);
     }
 }
 
@@ -453,14 +394,19 @@ static int mvv_lva[12][12] = {
     // Mirror for black attackers...
 };
 
-int score_move(int move)
+// Score moves to decide which to search first
+int score_move(int move, int pv_move, int ply)
 {
+    // 1. PV Move (Highest Priority)
+    if (pv_move && move == pv_move)
+        return 20000;
+
+    // 2. Captures (MVV-LVA)
     if (get_move_capture(move))
     {
         int target_square = get_move_target(move);
-        int victim = P; // Default
+        int victim = P;
 
-        // Determine the victim piece
         int start = (side == white) ? p : P;
         int end = (side == white) ? k : K;
         for (int p = start; p <= end; p++)
@@ -471,11 +417,19 @@ int score_move(int move)
                 break;
             }
         }
-
-        // MVV-LVA formula
         return mvv_lva[get_move_piece(move)][victim] + 10000;
     }
-    return 0;
+
+    // 3. Killer Moves (1st Killer)
+    if (killer_moves[0][ply] == move)
+        return 9000;
+
+    // 4. Killer Moves (2nd Killer)
+    if (killer_moves[1][ply] == move)
+        return 8000;
+
+    // 5. History Moves
+    return history_moves[get_move_piece(move)][get_move_target(move)];
 }
 
 // -------------------------------------------- \\
@@ -662,6 +616,104 @@ U64 get_random_U64_number()
 U64 generate_magic_candidate()
 {
     return get_random_U64_number() & get_random_U64_number() & get_random_U64_number();
+}
+
+// -------------------------------------------- \\
+//               ZOBRIST HASHING                \\
+// -------------------------------------------- \\
+
+// Zobrist keys
+U64 piece_keys[12][64];
+U64 side_key;
+U64 castle_keys[16];
+U64 enpassant_keys[64];
+
+// Current hash key
+U64 hash_key;
+
+// Initialize random keys
+void init_hash_keys()
+{
+    random_state = 1804289383; // Reset RNG for consistency
+    for (int p = P; p <= k; p++)
+        for (int s = 0; s < 64; s++)
+            piece_keys[p][s] = get_random_U64_number();
+    side_key = get_random_U64_number();
+    for (int i = 0; i < 16; i++)
+        castle_keys[i] = get_random_U64_number();
+    for (int i = 0; i < 64; i++)
+        enpassant_keys[i] = get_random_U64_number();
+}
+
+// Generate full hash key from scratch
+U64 generate_hash_key()
+{
+    U64 final_key = 0ULL;
+    for (int p = P; p <= k; p++)
+    {
+        U64 bitboard = bitboards[p];
+        while (bitboard)
+        {
+            final_key ^= piece_keys[p][get_ls1b_index(bitboard)];
+            pop_bit(bitboard, get_ls1b_index(bitboard));
+        }
+    }
+    if (side == black)
+        final_key ^= side_key;
+    if (en_passant != no_sq)
+        final_key ^= enpassant_keys[en_passant];
+    final_key ^= castle_keys[castle];
+    return final_key;
+}
+
+// TT flags
+#define HASH_EXACT 0
+#define HASH_ALPHA 1
+#define HASH_BETA 2
+
+typedef struct
+{
+    U64 key;   // Unique position identifier
+    int depth; // Search depth
+    int flags; // Node type (Exact, Alpha, Beta)
+    int value; // Score
+    int best_move;
+} tt_entry;
+
+#define TT_SIZE 0x400000 // ~4 million entries (approx 100MB)
+tt_entry transposition_table[TT_SIZE];
+
+void clear_tt()
+{
+    memset(transposition_table, 0, sizeof(transposition_table));
+}
+
+int read_tt(int alpha, int beta, int depth)
+{
+    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
+    if (entry->key == hash_key)
+    {
+        if (entry->depth >= depth)
+        {
+            if (entry->flags == HASH_EXACT)
+                return entry->value;
+            if (entry->flags == HASH_ALPHA && entry->value <= alpha)
+                return alpha;
+            if (entry->flags == HASH_BETA && entry->value >= beta)
+                return beta;
+        }
+    }
+    return -INF;
+}
+
+void write_tt(int depth, int value, int flags, int move)
+{
+    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
+    entry->key = hash_key;
+    entry->depth = depth;
+    entry->flags = flags;
+    entry->value = value;
+    entry->best_move = move;
 }
 
 // -------------------------------------------- \\
@@ -1156,153 +1208,6 @@ void init_sliders_attacks(int bishop)
 }
 
 // -------------------------------------------- \\
-//              INPUT / OUTPUT                  \\
-// -------------------------------------------- \\
-
-void parse_fen(char *fen)
-{
-    // 1. Clear Board State
-    for (int i = 0; i < 12; i++)
-        bitboards[i] = 0ULL;
-    for (int i = 0; i < 3; i++)
-        occupancies[i] = 0ULL;
-    side = 0;
-    en_passant = no_sq;
-    castle = 0;
-
-    // 2. Parse Pieces using a WHILE loop (Safer than 'for')
-    int rank = 0;
-    int file = 0;
-
-    while (rank < 8 && *fen && *fen != ' ')
-    {
-        int square = rank * 8 + file;
-
-        // Match Pieces (Letters)
-        if ((*fen >= 'a' && *fen <= 'z') || (*fen >= 'A' && *fen <= 'Z'))
-        {
-            int piece = -1;
-            // Map characters to Enum
-            switch (*fen)
-            {
-            case 'P':
-                piece = P;
-                break;
-            case 'N':
-                piece = N;
-                break;
-            case 'B':
-                piece = B;
-                break;
-            case 'R':
-                piece = R;
-                break;
-            case 'Q':
-                piece = Q;
-                break;
-            case 'K':
-                piece = K;
-                break;
-            case 'p':
-                piece = p;
-                break;
-            case 'n':
-                piece = n;
-                break;
-            case 'b':
-                piece = b;
-                break;
-            case 'r':
-                piece = r;
-                break;
-            case 'q':
-                piece = q;
-                break;
-            case 'k':
-                piece = k;
-                break;
-            }
-
-            // Set the bit and move to next square
-            if (piece != -1)
-                set_bit(bitboards[piece], square);
-            file++;
-            fen++;
-        }
-
-        // Match Empty Squares (Numbers)
-        else if (*fen >= '0' && *fen <= '9')
-        {
-            int offset = *fen - '0';
-            file += offset; // Skip 'offset' number of files
-            fen++;
-        }
-
-        // Match Rank Separator (Slash)
-        else if (*fen == '/')
-        {
-            file = 0; // Reset file
-            rank++;   // Go to next rank
-            fen++;
-        }
-
-        // Skip spaces or other junk
-        else
-        {
-            fen++;
-        }
-    }
-
-    // 3. Parse Side to Move
-    fen++;
-    side = (*fen == 'w') ? white : black;
-    fen += 2;
-
-    // 4. Parse Castling Rights
-    while (*fen != ' ')
-    {
-        switch (*fen)
-        {
-        case 'K':
-            castle |= wk;
-            break;
-        case 'Q':
-            castle |= wq;
-            break;
-        case 'k':
-            castle |= bk;
-            break;
-        case 'q':
-            castle |= bq;
-            break;
-        case '-':
-            break;
-        }
-        fen++;
-    }
-
-    // 5. Parse En Passant
-    fen++;
-    if (*fen != '-')
-    {
-        int file = fen[0] - 'a';
-        int rank = 8 - (fen[1] - '0');
-        en_passant = rank * 8 + file;
-    }
-    else
-    {
-        en_passant = no_sq;
-    }
-
-    // 6. Update Occupancies
-    for (int piece = P; piece <= K; piece++)
-        occupancies[white] |= bitboards[piece];
-    for (int piece = p; piece <= k; piece++)
-        occupancies[black] |= bitboards[piece];
-    occupancies[both] = occupancies[white] | occupancies[black];
-}
-
-// -------------------------------------------- \\
 //           MOVE GENERATION                    \\
 // -------------------------------------------- \\
 
@@ -1606,26 +1511,24 @@ void generate_moves(moves *move_list)
 // move: The encoded move integer
 // move_flag: 0 = all moves, 1 = only captures (for later)
 // Returns: 1 if legal, 0 if illegal (king left in check)
+
 int make_move(int move, int move_flag)
 {
-
-    // 1. Quiet Moves: If `move_flag` is capture-only, returns 0
+    // 1. Quiet Moves check
     if (move_flag == all_moves)
     {
-        // (We will use this later for Quiescence Search)
-        // For now, just pass 0 or 'all_moves' enum
+        // Continue
     }
     else
     {
-        // If capture flag is 1, ensure the move is a capture
         if (!get_move_capture(move))
             return 0;
     }
 
-    // 2. Copy Board State (Backup)
+    // 2. Backup Board
     copy_board();
 
-    // 3. Parse Move Info
+    // 3. Parse Move
     int source_square = get_move_source(move);
     int target_square = get_move_target(move);
     int piece = get_move_piece(move);
@@ -1635,24 +1538,18 @@ int make_move(int move, int move_flag)
     int enpass = get_move_enpassant(move);
     int castling = get_move_castling(move);
 
-    // Update hash: remove piece from source
-    hash_key ^= piece_keys[piece][source_square];
-    // Update hash: add piece to target
-    hash_key ^= piece_keys[piece][target_square];
-
-    // 4. Handle Movement (Bit Manipulation)
-    // Remove piece from source
+    // 4. Move Piece & Update Hash
     pop_bit(bitboards[piece], source_square);
-    // Add piece to target
     set_bit(bitboards[piece], target_square);
+
+    // HASH UPDATE: Position Change
+    hash_key ^= piece_keys[piece][source_square]; // Remove from source
+    hash_key ^= piece_keys[piece][target_square]; // Add to target
 
     // 5. Handle Captures
     if (capture)
     {
-        // Find which piece we just captured based on target square
-        // Loop through enemy pieces (start_piece to end_piece)
         int start_piece, end_piece;
-
         if (side == white)
         {
             start_piece = p;
@@ -1664,119 +1561,384 @@ int make_move(int move, int move_flag)
             end_piece = K;
         }
 
-        // Loop and remove the captured piece
         for (int bb_piece = start_piece; bb_piece <= end_piece; bb_piece++)
         {
             if (get_bit(bitboards[bb_piece], target_square))
             {
                 pop_bit(bitboards[bb_piece], target_square);
+
+                // HASH UPDATE: Remove captured piece
+                hash_key ^= piece_keys[bb_piece][target_square];
                 break;
             }
-            // Update hash: remove captured piece
-            hash_key ^= piece_keys[bb_piece][target_square];
         }
     }
 
     // 6. Handle Promotions
     if (promoted_piece)
     {
-        // Remove the pawn we just placed on rank 8
+        // Remove the pawn from board (we already moved it to target in step 4)
         pop_bit(bitboards[(side == white) ? P : p], target_square);
-        // Place the new promoted piece
+        // Add promoted piece
         set_bit(bitboards[promoted_piece], target_square);
+
+        // HASH UPDATE: Change Pawn to Promoted Piece
+        hash_key ^= piece_keys[(side == white) ? P : p][target_square]; // Remove Pawn
+        hash_key ^= piece_keys[promoted_piece][target_square];          // Add Queen/Knight...
     }
 
-    // 7. Handle En Passant
+    // 7. Handle En Passant Capture
     if (enpass)
     {
-        // If White captures En Passant, remove Black pawn south of target
         if (side == white)
         {
             pop_bit(bitboards[p], target_square + 8);
+            // HASH UPDATE: Remove the captured pawn
+            hash_key ^= piece_keys[p][target_square + 8];
         }
-        // If Black captures En Passant, remove White pawn north of target
         else
         {
             pop_bit(bitboards[P], target_square - 8);
+            // HASH UPDATE: Remove the captured pawn
+            hash_key ^= piece_keys[P][target_square - 8];
         }
     }
 
-    // 8. Reset En Passant Square
-    // Usually we reset it every move, unless a double push sets a new one
+    // 8. Handle En Passant State Update
+    if (en_passant != no_sq)
+        hash_key ^= enpassant_keys[en_passant]; // Remove old En Passant Key
+
     en_passant = no_sq;
 
-    // 9. Handle Double Push (Set En Passant Square)
     if (double_push)
     {
         if (side == white)
+        {
             en_passant = target_square + 8;
+            hash_key ^= enpassant_keys[target_square + 8]; // Add new En Passant Key
+        }
         else
+        {
             en_passant = target_square - 8;
+            hash_key ^= enpassant_keys[target_square - 8]; // Add new En Passant Key
+        }
     }
 
-    // 10. Handle Castling
+    // 9. Handle Castling (Move Rooks)
     if (castling)
     {
         switch (target_square)
         {
-        // White King Side
-        case g1:
+        case g1: // White King Side
             pop_bit(bitboards[R], h1);
             set_bit(bitboards[R], f1);
+            // HASH UPDATE: Rook Move
+            hash_key ^= piece_keys[R][h1];
+            hash_key ^= piece_keys[R][f1];
             break;
-        // White Queen Side
-        case c1:
+        case c1: // White Queen Side
             pop_bit(bitboards[R], a1);
             set_bit(bitboards[R], d1);
+            // HASH UPDATE: Rook Move
+            hash_key ^= piece_keys[R][a1];
+            hash_key ^= piece_keys[R][d1];
             break;
-        // Black King Side
-        case g8:
+        case g8: // Black King Side
             pop_bit(bitboards[r], h8);
             set_bit(bitboards[r], f8);
+            // HASH UPDATE: Rook Move
+            hash_key ^= piece_keys[r][h8];
+            hash_key ^= piece_keys[r][f8];
             break;
-        // Black Queen Side
-        case c8:
+        case c8: // Black Queen Side
             pop_bit(bitboards[r], a8);
             set_bit(bitboards[r], d8);
+            // HASH UPDATE: Rook Move
+            hash_key ^= piece_keys[r][a8];
+            hash_key ^= piece_keys[r][d8];
             break;
         }
     }
 
-    // 11. Update Castling Rights
-    // If King or Rook moves/captured, rights are lost.
-    // We update this by ANDing the current rights with a pre-calculated table.
-    // simpler logic:
+    // 10. Update Castling Rights
+    hash_key ^= castle_keys[castle]; // Remove old Castling Key
+
     castle &= castling_rights[source_square];
     castle &= castling_rights[target_square];
 
-    // 12. Update Occupancies
-    // Clear all
+    hash_key ^= castle_keys[castle]; // Add new Castling Key
+
+    // 11. Update Occupancies
     for (int i = 0; i < 3; i++)
         occupancies[i] = 0ULL;
-    // Rebuild
     for (int bb_piece = P; bb_piece <= K; bb_piece++)
         occupancies[white] |= bitboards[bb_piece];
     for (int bb_piece = p; bb_piece <= k; bb_piece++)
         occupancies[black] |= bitboards[bb_piece];
     occupancies[both] = occupancies[white] | occupancies[black];
 
-    // 13. Change Side
+    // 12. Change Side
     side ^= 1;
     hash_key ^= side_key;
 
-    // 14. CHECK FOR LEGALITY
-    // If the King is in check after the move, it was illegal.
+    // 13. Legality Check
     if (is_square_attacked((side == white) ? get_ls1b_index(bitboards[k]) : get_ls1b_index(bitboards[K]), side))
     {
-        // Move is illegal, take it back
         take_back();
         return 0;
     }
+    return 1;
+}
+
+// -------------------------------------------- \\
+//              INPUT / OUTPUT                  \\
+// -------------------------------------------- \\
+
+void parse_fen(char *fen)
+{
+    // 1. Clear Board State
+    for (int i = 0; i < 12; i++)
+        bitboards[i] = 0ULL;
+    for (int i = 0; i < 3; i++)
+        occupancies[i] = 0ULL;
+    side = 0;
+    en_passant = no_sq;
+    castle = 0;
+
+    // 2. Parse Pieces with bounds checking
+    int rank = 0;
+    int file = 0;
+
+    while (rank < 8 && *fen && *fen != ' ')
+    {
+        int square = rank * 8 + file;
+
+        // Match Pieces (Letters)
+        if ((*fen >= 'a' && *fen <= 'z') || (*fen >= 'A' && *fen <= 'Z'))
+        {
+            int piece = -1;
+            switch (*fen)
+            {
+            case 'P':
+                piece = P;
+                break;
+            case 'N':
+                piece = N;
+                break;
+            case 'B':
+                piece = B;
+                break;
+            case 'R':
+                piece = R;
+                break;
+            case 'Q':
+                piece = Q;
+                break;
+            case 'K':
+                piece = K;
+                break;
+            case 'p':
+                piece = p;
+                break;
+            case 'n':
+                piece = n;
+                break;
+            case 'b':
+                piece = b;
+                break;
+            case 'r':
+                piece = r;
+                break;
+            case 'q':
+                piece = q;
+                break;
+            case 'k':
+                piece = k;
+                break;
+            }
+
+            if (piece != -1)
+                set_bit(bitboards[piece], square);
+            file++;
+            fen++;
+        }
+        // Match Empty Squares (Numbers)
+        else if (*fen >= '0' && *fen <= '9')
+        {
+            int offset = *fen - '0';
+            file += offset;
+            fen++;
+        }
+        // Match Rank Separator (Slash)
+        else if (*fen == '/')
+        {
+            file = 0;
+            rank++;
+            fen++;
+        }
+        else
+        {
+            fen++;
+        }
+    }
+
+    // 3-6: Same as original...
+    fen++;
+    side = (*fen == 'w') ? white : black;
+    fen += 2;
+
+    while (*fen != ' ')
+    {
+        switch (*fen)
+        {
+        case 'K':
+            castle |= wk;
+            break;
+        case 'Q':
+            castle |= wq;
+            break;
+        case 'k':
+            castle |= bk;
+            break;
+        case 'q':
+            castle |= bq;
+            break;
+        case '-':
+            break;
+        }
+        fen++;
+    }
+
+    fen++;
+    if (*fen != '-')
+    {
+        int file = fen[0] - 'a';
+        int rank = 8 - (fen[1] - '0');
+        en_passant = rank * 8 + file;
+    }
     else
     {
-        // Move is legal
-        return 1;
+        en_passant = no_sq;
     }
+
+    for (int piece = P; piece <= K; piece++)
+        occupancies[white] |= bitboards[piece];
+    for (int piece = p; piece <= k; piece++)
+        occupancies[black] |= bitboards[piece];
+    occupancies[both] = occupancies[white] | occupancies[black];
+
+    hash_key = generate_hash_key();
+}
+// Parse move string (e.g. "e2e4") into move integer
+int parse_move(char *move_string)
+{
+    // SAFETY CHECK: Validate string length
+    if (!move_string || strlen(move_string) < 4)
+        return 0;
+
+    moves move_list[1];
+    generate_moves(move_list);
+
+    int source_file = move_string[0] - 'a';
+    int source_rank = 8 - (move_string[1] - '0');
+    int target_file = move_string[2] - 'a';
+    int target_rank = 8 - (move_string[3] - '0');
+
+    // BOUNDS CHECK
+    if (source_file < 0 || source_file > 7 ||
+        source_rank < 0 || source_rank > 7 ||
+        target_file < 0 || target_file > 7 ||
+        target_rank < 0 || target_rank > 7)
+        return 0;
+
+    int source = source_rank * 8 + source_file;
+    int target = target_rank * 8 + target_file;
+
+    for (int count = 0; count < move_list->count; count++)
+    {
+        int move = move_list->moves[count];
+
+        if (get_move_source(move) == source && get_move_target(move) == target)
+        {
+            int promoted = get_move_promoted(move);
+
+            if (promoted)
+            {
+                // Check if string has promotion character
+                if (strlen(move_string) < 5)
+                    continue;
+
+                if ((promoted == Q || promoted == q) && move_string[4] == 'q')
+                    return move;
+                if ((promoted == R || promoted == r) && move_string[4] == 'r')
+                    return move;
+                if ((promoted == B || promoted == b) && move_string[4] == 'b')
+                    return move;
+                if ((promoted == N || promoted == n) && move_string[4] == 'n')
+                    return move;
+                continue;
+            }
+
+            return move;
+        }
+    }
+    return 0;
+}
+// Parse UCI "position" command
+void parse_position(char *command)
+{
+    // 1. Shift pointer to the command content
+    command += 9;
+    char *current_char = command;
+
+    // 2. Parse "startpos"
+    if (strncmp(command, "startpos", 8) == 0)
+    {
+        parse_fen(start_position);
+    }
+    // 3. Parse "fen" (if setting a specific puzzle)
+    else
+    {
+        // Assume "fen " comes after "position "
+        current_char = strstr(command, "fen");
+        if (current_char == NULL)
+        {
+            parse_fen(start_position); // Fallback
+        }
+        else
+        {
+            current_char += 4; // Skip "fen "
+            parse_fen(current_char);
+        }
+    }
+
+    // 4. Parse "moves" (Play the moves on the board)
+    current_char = strstr(command, "moves");
+    if (current_char != NULL)
+    {
+        current_char += 6; // Skip "moves "
+
+        // Loop through all moves in the string
+        while (*current_char)
+        {
+            int move = parse_move(current_char);
+
+            if (move == 0)
+                break; // Safety break
+
+            make_move(move, all_moves);
+
+            // Move pointer to the end of the current move string
+            while (*current_char && *current_char != ' ')
+                current_char++;
+
+            // Skip space to get to the next move
+            current_char++;
+        }
+    }
+
+    // 5. Update Board State
+    print_board();
 }
 
 // -------------------------------------------- \\
@@ -1865,7 +2027,7 @@ int quiescence(int alpha, int beta)
         // Move sorting logic (Selection Sort)
         for (int next = count + 1; next < move_list->count; next++)
         {
-            if (score_move(move_list->moves[count]) < score_move(move_list->moves[next]))
+            if (score_move(move_list->moves[count], 0, 0) < score_move(move_list->moves[next], 0, 0))
             {
                 int temp = move_list->moves[count];
                 move_list->moves[count] = move_list->moves[next];
@@ -1886,43 +2048,149 @@ int quiescence(int alpha, int beta)
     return alpha;
 }
 
-// Negamax with Alpha-Beta Pruning
-int negamax(int alpha, int beta, int depth)
+// Negamax with Alpha-Beta, Killer Moves, and History Heuristic
+int negamax(int alpha, int beta, int depth, int ply)
 {
-
     // 1. Check Transposition Table
     int score = read_tt(alpha, beta, depth);
-    if (score != -INF)
+    // If we have a stored value and we are not at the root (ply 0), use it
+    if (ply && score != -INF && (ply < 64)) // Safety check
         return score;
 
+    // PV Check from TT
+    int pv_move = 0;
+    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
+    if (entry->key == hash_key)
+        pv_move = entry->best_move;
+
+    // 2. Base Case: Quiescence Search
     if (depth == 0)
         return quiescence(alpha, beta);
 
+    // Safety check for array bounds
+    if (ply > 63)
+        return evaluate();
+
+    // --- NULL MOVE PRUNING ---
+    // Rules:
+    // 1. Depth must be >= 3 (Don't prune in shallow search)
+    // 2. Not root node (ply > 0)
+    // 3. Not in Check (If in check, you MUST move)
+
+    // Check if King is in check
+    int in_check = is_square_attacked((side == white) ? get_ls1b_index(bitboards[K]) : get_ls1b_index(bitboards[k]), side ^ 1);
+
+    if (depth >= 3 && !in_check && ply > 0)
+    {
+        // Backup board
+        copy_board();
+
+        // Make Null Move (Switch side, clear En Passant)
+        side ^= 1;
+        hash_key ^= side_key;
+
+        if (en_passant != no_sq)
+        {
+            hash_key ^= enpassant_keys[en_passant];
+            en_passant = no_sq;
+        }
+
+        // Search with reduced depth (R=2)
+        // We pass -beta, -beta+1 (Zero Window) because we only care if >= beta
+        int score = -negamax(-beta, -beta + 1, depth - 1 - 2, ply + 1);
+
+        // Restore board
+        take_back();
+
+        // If the null move result is still a cutoff, return beta
+        if (score >= beta)
+            return beta;
+    }
+    // -------------------------
+
     moves move_list[1];
     generate_moves(move_list);
-    int old_alpha = alpha;
+
     int moves_searched = 0;
     int best_so_far = -INF;
     int move_to_store = 0;
+    int old_alpha = alpha;
 
+    // [Inside negamax, replacing the existing loop]
     for (int count = 0; count < move_list->count; count++)
     {
-        // Move sorting logic (Selection Sort)
+        // Sort Moves
         for (int next = count + 1; next < move_list->count; next++)
         {
-            if (score_move(move_list->moves[count]) < score_move(move_list->moves[next]))
+            if (score_move(move_list->moves[count], pv_move, ply) < score_move(move_list->moves[next], pv_move, ply))
             {
                 int temp = move_list->moves[count];
                 move_list->moves[count] = move_list->moves[next];
                 move_list->moves[next] = temp;
             }
         }
+
         copy_board();
         if (!make_move(move_list->moves[count], all_moves))
             continue;
 
         moves_searched++;
-        int score = -negamax(-beta, -alpha, depth - 1);
+
+        // --- PRINCIPAL VARIATION SEARCH (PVS) START ---
+
+        if (count == 0)
+        {
+            // 1. PV Move: Full Search
+            score = -negamax(-beta, -alpha, depth - 1, ply + 1);
+        }
+        else
+        {
+            // 2. Late Move Reduction (LMR) will go here later...
+            // [Insert this inside the 'else' block of PVS]
+
+            // LMR Conditions:
+            // - Depth is substantial (> 2)
+            // - We have searched at least 4 moves already
+            // - Not a capture (Tactical moves are dangerous to reduce)
+            // - Not in check (Safety first)
+            // --- LATE MOVE REDUCTION (LMR) ---
+
+            // Condition to check if we should search this move
+            // Default: We assume we need to search it (Zero Window)
+            int needs_full_search = 1;
+
+            if (depth >= 3 && moves_searched > 4 && !get_move_capture(move_list->moves[count]))
+            {
+                // Search with reduced depth
+                score = -negamax(-alpha - 1, -alpha, depth - 2, ply + 1);
+
+                // If the reduced search confirms the move is bad (score <= alpha),
+                // we don't need to search further.
+                if (score <= alpha)
+                {
+                    needs_full_search = 0;
+                }
+            }
+
+            // --- ZERO WINDOW SEARCH ---
+
+            // Only search if LMR didn't prove the move was bad
+            if (needs_full_search)
+            {
+                score = -negamax(-alpha - 1, -alpha, depth - 1, ply + 1);
+            }
+
+            // --- RE-SEARCH (Full Window) ---
+
+            // If the move turns out to be better than expected, we must search it fully
+            if (score > alpha && score < beta)
+            {
+                score = -negamax(-beta, -alpha, depth - 1, ply + 1);
+            }
+        }
+
+        // --- PRINCIPAL VARIATION SEARCH (PVS) END ---
+
         take_back();
 
         if (score > best_so_far)
@@ -1932,27 +2200,33 @@ int negamax(int alpha, int beta, int depth)
         }
 
         if (score >= beta)
-        { // Store fail-high (Beta)
+        {
+            if (!get_move_capture(move_list->moves[count]))
+            {
+                killer_moves[1][ply] = killer_moves[0][ply];
+                killer_moves[0][ply] = move_list->moves[count];
+                history_moves[get_move_piece(move_list->moves[count])][get_move_target(move_list->moves[count])] += depth * depth;
+            }
             write_tt(depth, beta, HASH_BETA, move_list->moves[count]);
             return beta;
         }
+
         if (score > alpha)
         {
             alpha = score;
-            if (depth == search_depth)
-                best_move = move_list->moves[count]; // Root best move
+            if (ply == 0)
+                best_move = move_list->moves[count];
         }
     }
 
     if (moves_searched == 0)
     {
         if (is_square_attacked((side == white) ? get_ls1b_index(bitboards[K]) : get_ls1b_index(bitboards[k]), side ^ 1))
-            return -MATE; // Checkmate
+            return -MATE + ply; // MATE score corrected for distance (shorter mate is better)
         else
-            return 0; // Stalemate
+            return 0;
     }
 
-    // Store exact or alpha value
     int flag = (alpha > old_alpha) ? HASH_EXACT : HASH_ALPHA;
     write_tt(depth, alpha, flag, move_to_store);
 
@@ -2031,7 +2305,6 @@ void perft_test(int depth)
 // UCI loop
 void uci_loop()
 {
-    // Standard UCI handshake settings
     setbuf(stdin, NULL);
     setbuf(stdout, NULL);
 
@@ -2042,36 +2315,46 @@ void uci_loop()
 
     while (1)
     {
+        memset(input, 0, sizeof(input));
+        fflush(stdout);
+
         if (!fgets(input, 2000, stdin))
             continue;
         if (input[0] == '\n')
             continue;
 
-        // Respond to isready
         if (strncmp(input, "isready", 7) == 0)
         {
             printf("readyok\n");
             continue;
         }
-
-        // Respond to ucinewgame
+        else if (strncmp(input, "position", 8) == 0)
+        {
+            parse_position(input);
+            clear_tt(); // Optional: Clear hash on new position to avoid collisions
+        }
         else if (strncmp(input, "ucinewgame", 10) == 0)
         {
-            // Reset to starting position
-            parse_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+            parse_position("position startpos");
+            clear_tt();
         }
-
-        // Handle go command (start searching)
         else if (strncmp(input, "go", 2) == 0)
         {
-            // Iterative Deepening
-            for (int depth = 1; depth <= 10; depth++)
-            {
-                search_depth = depth;
-                int score = negamax(-INF, INF, depth);
+            int depth = -1;
+            char *ptr = strstr(input, "depth");
+            if (ptr)
+                depth = atoi(ptr + 6);
+            else
+                depth = 6;
 
-                // Output info for the GUI
-                printf("info depth %d score cp %d pv ", depth, score);
+            // Search
+            for (int current_depth = 1; current_depth <= depth; current_depth++)
+            {
+                search_depth = current_depth;
+                int score = negamax(-INF, INF, current_depth, 0);
+
+                printf("info depth %d score cp %d pv ", current_depth, score);
+                // (Optional: Print full PV line here if you stored it)
                 print_move(best_move);
                 printf("\n");
             }
@@ -2079,20 +2362,32 @@ void uci_loop()
             print_move(best_move);
             printf("\n");
         }
-
-        // Quit engine
         else if (strncmp(input, "quit", 4) == 0)
         {
             break;
+        }
+        else if (strncmp(input, "uci", 3) == 0)
+        {
+            printf("id name Fe64\n");
+            printf("id author Syed Masood\n");
+            printf("uciok\n");
         }
     }
 }
 
 int main()
 {
-    init_leapers_attacks();
-    init_sliders_attacks(0);
-    init_sliders_attacks(1);
+    // CRITICAL: Initialize attack tables BEFORE using them!
+    init_leapers_attacks();  // Initialize pawn, knight, king attacks
+    init_sliders_attacks(1); // Initialize bishop attacks (1 = bishop)
+    init_sliders_attacks(0); // Initialize rook attacks (0 = rook)
+
+    init_hash_keys();
+    hash_key = generate_hash_key();
+    clear_tt();
+
+    memset(killer_moves, 0, sizeof(killer_moves));
+    memset(history_moves, 0, sizeof(history_moves));
 
     uci_loop();
 
