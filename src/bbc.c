@@ -171,6 +171,9 @@ int side;               // Current side to move (0=white, 1=black)
 int en_passant = no_sq; // En passant square (if available, else 'no_sq')
 int castle;             // Castling rights integer (e.g., 1111 in binary = 15)
 
+// Search Depth
+int search_depth;
+
 // Castling rights update constants
 const int castling_rights[64] = {
     7, 15, 15, 15, 3, 15, 15, 11,
@@ -181,6 +184,60 @@ const int castling_rights[64] = {
     15, 15, 15, 15, 15, 15, 15, 15,
     15, 15, 15, 15, 15, 15, 15, 15,
     13, 15, 15, 15, 12, 15, 15, 14};
+
+// Piece-square tables to bias the engine's personality
+// Higher values = piece wants to be there.
+// These tables encourage center control and King-side attacks.
+
+const int pawn_score[64] = {
+    90, 90, 90, 90, 90, 90, 90, 90,
+    30, 30, 30, 40, 40, 30, 30, 30,
+    20, 20, 20, 30, 30, 20, 20, 20,
+    10, 10, 10, 20, 20, 10, 10, 10,
+    5, 5, 10, 20, 20, 5, 5, 5,
+    0, 0, 0, 5, 5, 0, 0, 0,
+    0, 0, 0, -10, -10, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0};
+
+const int knight_score[64] = {
+    -50, -40, -30, -30, -30, -30, -40, -50,
+    -40, -20, 0, 0, 0, 0, -20, -40,
+    -30, 0, 10, 15, 15, 10, 0, -30,
+    -30, 5, 15, 20, 20, 15, 5, -30,
+    -30, 0, 15, 20, 20, 15, 0, -30,
+    -30, 5, 10, 15, 15, 10, 5, -30,
+    -40, -20, 0, 5, 5, 0, -20, -40,
+    -50, -40, -30, -30, -30, -30, -40, -50};
+
+const int bishop_score[64] = {
+    -20, -10, -10, -10, -10, -10, -10, -20,
+    -10, 0, 0, 0, 0, 0, 0, -10,
+    -10, 0, 5, 10, 10, 5, 0, -10,
+    -10, 5, 5, 10, 10, 5, 5, -10,
+    -10, 0, 10, 10, 10, 10, 0, -10,
+    -10, 10, 10, 10, 10, 10, 10, -10,
+    -10, 5, 0, 0, 0, 0, 5, -10,
+    -20, -10, -10, -10, -10, -10, -10, -20};
+
+const int rook_score[64] = {
+    0, 0, 0, 0, 0, 0, 0, 0,
+    5, 10, 10, 10, 10, 10, 10, 5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    0, 0, 0, 5, 5, 0, 0, 0};
+
+const int king_score[64] = {
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -20, -30, -30, -40, -40, -30, -30, -20,
+    -10, -20, -20, -20, -20, -20, -20, -10,
+    20, 20, 0, 0, 0, 0, 20, 20,
+    20, 30, 10, 0, 0, 10, 30, 20};
 
 // -------------------------------------------- \\
 //             BITWISE MACROS                   \\
@@ -1575,11 +1632,127 @@ int make_move(int move, int move_flag)
 }
 
 // -------------------------------------------- \\
+//       Evaluation & Negamax Algorithm         \\
+// -------------------------------------------- \\
+
+// Piece values
+int material_weights[12] = {
+    100, 300, 350, 500, 1000, 10000,      // White P, N, B, R, Q, K
+    -100, -300, -350, -500, -1000, -10000 // Black p, n, b, r, q, k
+};
+
+int evaluate()
+{
+    int score = 0;
+    U64 bitboard;
+    int square;
+
+    for (int piece = P; piece <= k; piece++)
+    {
+        bitboard = bitboards[piece];
+        while (bitboard)
+        {
+            square = get_ls1b_index(bitboard);
+
+            // Add Material weight
+            score += material_weights[piece];
+
+            // Add Positional weight
+            switch (piece)
+            {
+            case P:
+                score += pawn_score[square];
+                break;
+            case N:
+                score += knight_score[square];
+                break;
+            case B:
+                score += bishop_score[square];
+                break;
+            case R:
+                score += rook_score[square];
+                break;
+            case K:
+                score += king_score[square];
+                break;
+
+            // Mirror indices for black pieces (subtracting because black is negative)
+            case p:
+                score -= pawn_score[square ^ 56];
+                break;
+            case n:
+                score -= knight_score[square ^ 56];
+                break;
+            case b:
+                score -= bishop_score[square ^ 56];
+                break;
+            case r:
+                score -= rook_score[square ^ 56];
+                break;
+            case k:
+                score -= king_score[square ^ 56];
+                break;
+            }
+            pop_bit(bitboard, square);
+        }
+    }
+    return (side == white) ? score : -score;
+}
+
+// Search Constants
+#define INF 50000
+#define MATE 49000
+
+int best_move;
+
+// Negamax with Alpha-Beta Pruning
+int negamax(int alpha, int beta, int depth)
+{
+    if (depth == 0)
+        return evaluate();
+
+    moves move_list[1];
+    generate_moves(move_list);
+    int old_alpha = alpha;
+    int moves_searched = 0;
+
+    for (int count = 0; count < move_list->count; count++)
+    {
+        copy_board();
+        if (!make_move(move_list->moves[count], all_moves))
+            continue;
+
+        moves_searched++;
+        int score = -negamax(-beta, -alpha, depth - 1);
+        take_back();
+
+        if (score >= beta)
+            return beta; // Fail high
+        if (score > alpha)
+        {
+            alpha = score;
+            if (depth == search_depth)
+                best_move = move_list->moves[count]; // Root best move
+        }
+    }
+
+    if (moves_searched == 0)
+    {
+        if (is_square_attacked((side == white) ? get_ls1b_index(bitboards[K]) : get_ls1b_index(bitboards[k]), side ^ 1))
+            return -MATE; // Checkmate
+        else
+            return 0; // Stalemate
+    }
+
+    return alpha;
+}
+
+// -------------------------------------------- \\
 //                PERFORMANCE TEST              \\
 // -------------------------------------------- \\
 
 // Leaf nodes count
-long nodes;
+long long nodes;
 
 // Perft driver
 static inline void perft_driver(int depth)
@@ -1636,18 +1809,63 @@ void perft_test(int depth)
     }
 
     printf("\n  Depth: %d\n", depth);
-    printf("  Nodes: %ld\n", nodes);
+    printf("  Nodes: %lld\n", nodes);
 }
 
 // -------------------------------------------- \\
 //                MAIN DRIVER                   \\
 // -------------------------------------------- \\
 
-// START POSITION FEN
-char *start_position = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+// UCI loop
+void uci_loop()
+{
+    // Standard UCI handshake settings
+    setbuf(stdin, NULL);
+    setbuf(stdout, NULL);
 
-// TRICKY FEN (From the tutorial - checks handling of empty spaces)
-char *tricky_position = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+    char input[2000];
+    printf("id name Fe64\n");
+    printf("id author Syed Masood\n");
+    printf("uciok\n");
+
+    while (1)
+    {
+        if (!fgets(input, 2000, stdin))
+            continue;
+        if (input[0] == '\n')
+            continue;
+
+        // Respond to isready
+        if (strncmp(input, "isready", 7) == 0)
+        {
+            printf("readyok\n");
+            continue;
+        }
+
+        // Respond to ucinewgame
+        else if (strncmp(input, "ucinewgame", 10) == 0)
+        {
+            // Reset to starting position
+            parse_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        }
+
+        // Handle go command (start searching)
+        else if (strncmp(input, "go", 2) == 0)
+        {
+            // Search to depth 6 and output best move
+            int score = negamax(-INF, INF, 6);
+            printf("bestmove ");
+            print_move(best_move);
+            printf("\n");
+        }
+
+        // Quit engine
+        else if (strncmp(input, "quit", 4) == 0)
+        {
+            break;
+        }
+    }
+}
 
 int main()
 {
@@ -1655,11 +1873,7 @@ int main()
     init_sliders_attacks(0);
     init_sliders_attacks(1);
 
-    parse_fen(tricky_position);
-    print_board();
-
-    // The moment of truth
-    perft_test(5);
+    uci_loop();
 
     return 0;
 }
