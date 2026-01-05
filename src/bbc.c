@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/time.h>
 
 // Attack Tables
 
@@ -430,6 +431,36 @@ int score_move(int move, int pv_move, int ply)
 
     // 5. History Moves
     return history_moves[get_move_piece(move)][get_move_target(move)];
+}
+
+// -------------------------------------------- \\
+//               TIME MANAGEMENT                \\
+// -------------------------------------------- \\
+
+// Get time in milliseconds
+long long get_time_ms()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+// Global timing variables
+long long start_time;
+long long stop_time;
+long long time_for_move;
+int times_up = 0;
+
+// Check if time is up
+void communicate()
+{
+    if (times_up)
+        return;
+
+    if ((get_time_ms() - start_time) > time_for_move)
+    {
+        times_up = 1; // STOP THE SEARCH
+    }
 }
 
 // -------------------------------------------- \\
@@ -2051,6 +2082,16 @@ int quiescence(int alpha, int beta)
 // Negamax with Alpha-Beta, Killer Moves, and History Heuristic
 int negamax(int alpha, int beta, int depth, int ply)
 {
+
+    // 1. Time Check (Every 2048 nodes to save performance)
+    if ((nodes & 2047) == 0)
+    {
+        communicate();
+    }
+    // Abort if time is up
+    if (times_up)
+        return 0; // Return garbage, we will discard this search anyway
+
     // 1. Check Transposition Table
     int score = read_tt(alpha, beta, depth);
     // If we have a stored value and we are not at the root (ply 0), use it
@@ -2338,30 +2379,105 @@ void uci_loop()
             parse_position("position startpos");
             clear_tt();
         }
+
         else if (strncmp(input, "go", 2) == 0)
         {
+            // 1. Initialize Time Variables
             int depth = -1;
-            char *ptr = strstr(input, "depth");
-            if (ptr)
-                depth = atoi(ptr + 6);
-            else
-                depth = 6;
+            int movestogo = 30;
+            int movetime = -1;
+            int time = -1;
+            int inc = 0;
+            char *ptr = NULL;
 
-            // Search
-            for (int current_depth = 1; current_depth <= depth; current_depth++)
+            // 2. Parse Depth (if fixed depth requested)
+            if ((ptr = strstr(input, "depth")))
+                depth = atoi(ptr + 6);
+
+            // 3. Parse Time (wtime/btime)
+            if ((ptr = strstr(input, "movestogo")))
+                movestogo = atoi(ptr + 10);
+            if ((ptr = strstr(input, "movetime")))
+                movetime = atoi(ptr + 9);
+
+            if (side == white)
             {
-                search_depth = current_depth;
+                if ((ptr = strstr(input, "wtime")))
+                    time = atoi(ptr + 6);
+                if ((ptr = strstr(input, "winc")))
+                    inc = atoi(ptr + 5);
+            }
+            else
+            {
+                if ((ptr = strstr(input, "btime")))
+                    time = atoi(ptr + 6);
+                if ((ptr = strstr(input, "binc")))
+                    inc = atoi(ptr + 5);
+            }
+
+            // 4. Calculate Time to Spend
+            if (movetime != -1)
+            {
+                time = movetime;
+                movestogo = 1;
+            }
+            else if (time != -1)
+            {
+                time /= movestogo; // Simple logic: divide remaining time by moves
+                time -= 50;        // Safety buffer
+                if (time < 0)
+                    time = 0;
+            }
+
+            if (depth == -1)
+                search_depth = 64; // Infinite depth if not fixed
+            else
+                search_depth = depth;
+
+            // 5. Setup Search Globals
+            start_time = get_time_ms();
+            // If time is set, use it. Otherwise, assume infinite (for analysis or fixed depth)
+            if (time != -1)
+            {
+                time_for_move = time + inc;
+                stop_time = start_time + time_for_move;
+                times_up = 0;
+            }
+            else
+            {
+                time_for_move = -1; // Infinite
+                times_up = 0;
+            }
+
+            // 6. Iterative Deepening Loop with Time Check
+            long long nodes_searched = 0; // Reset for stats
+
+            printf("info string Time allocated: %lld ms\n", time_for_move);
+
+            for (int current_depth = 1; current_depth <= search_depth; current_depth++)
+            {
+                // If time ran out during the previous iteration, STOP.
+                if (times_up)
+                    break;
+
                 int score = negamax(-INF, INF, current_depth, 0);
 
+                // If time ran out DURING the search, discard the result and break
+                if (times_up)
+                    break;
+
+                // Output info
                 printf("info depth %d score cp %d pv ", current_depth, score);
-                // (Optional: Print full PV line here if you stored it)
-                print_move(best_move);
+                print_move(best_move); // Just the best move for now
                 printf("\n");
             }
+
+            // 7. Output Final Best Move
             printf("bestmove ");
             print_move(best_move);
             printf("\n");
         }
+
         else if (strncmp(input, "quit", 4) == 0)
         {
             break;
