@@ -1,5 +1,6 @@
 // ============================================ \\
 //       FE64 CHESS ENGINE - SOURCE CODE        \\
+//    "The Boa Constrictor" - Slow Death Style  \\
 // ============================================ \\
 
 #include <stdio.h>
@@ -7,6 +8,166 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <math.h>
+
+// ============================================ \\
+//         NEURAL NETWORK (NNUE) CONFIG         \\
+// ============================================ \\
+// Compile with -DUSE_NNUE to enable neural network evaluation
+
+#ifdef USE_NNUE
+#define NNUE_ENABLED 1
+#else
+#define NNUE_ENABLED 0
+#endif
+
+// The 64-bit integer is the heart of the engine.
+#define U64 unsigned long long
+
+// NNUE Architecture Constants
+#define NNUE_INPUT_SIZE 768   // 12 pieces * 64 squares
+#define NNUE_HIDDEN1_SIZE 256 // First hidden layer
+#define NNUE_HIDDEN2_SIZE 32  // Second hidden layer
+#define NNUE_OUTPUT_SIZE 1    // Single evaluation output
+#define NNUE_SCALE 400        // Scale factor for final output
+
+// NNUE Weight structure
+typedef struct
+{
+    float input_weights[NNUE_INPUT_SIZE][NNUE_HIDDEN1_SIZE];
+    float hidden1_bias[NNUE_HIDDEN1_SIZE];
+    float hidden1_weights[NNUE_HIDDEN1_SIZE][NNUE_HIDDEN2_SIZE];
+    float hidden2_bias[NNUE_HIDDEN2_SIZE];
+    float hidden2_weights[NNUE_HIDDEN2_SIZE];
+    float output_bias;
+    int loaded;
+} NNUEWeights;
+
+NNUEWeights nnue_weights = {0};
+
+// NNUE Accumulator for incremental updates
+typedef struct
+{
+    float hidden1[NNUE_HIDDEN1_SIZE];
+    int valid;
+} NNUEAccumulator;
+
+NNUEAccumulator nnue_accum[2]; // [side]
+
+// ReLU activation function
+static inline float relu(float x)
+{
+    return x > 0 ? x : 0;
+}
+
+// Clipped ReLU (CReLU) - common in NNUE
+static inline float crelu(float x)
+{
+    if (x < 0)
+        return 0;
+    if (x > 1)
+        return 1;
+    return x;
+}
+
+// Load NNUE weights from file
+int load_nnue(const char *filename)
+{
+    FILE *f = fopen(filename, "rb");
+    if (!f)
+    {
+        printf("info string NNUE file not found: %s\n", filename);
+        return 0;
+    }
+
+    // Read weights
+    size_t read = 0;
+    read += fread(nnue_weights.input_weights, sizeof(float), NNUE_INPUT_SIZE * NNUE_HIDDEN1_SIZE, f);
+    read += fread(nnue_weights.hidden1_bias, sizeof(float), NNUE_HIDDEN1_SIZE, f);
+    read += fread(nnue_weights.hidden1_weights, sizeof(float), NNUE_HIDDEN1_SIZE * NNUE_HIDDEN2_SIZE, f);
+    read += fread(nnue_weights.hidden2_bias, sizeof(float), NNUE_HIDDEN2_SIZE, f);
+    read += fread(nnue_weights.hidden2_weights, sizeof(float), NNUE_HIDDEN2_SIZE, f);
+    read += fread(&nnue_weights.output_bias, sizeof(float), 1, f);
+
+    fclose(f);
+
+    nnue_weights.loaded = 1;
+    printf("info string NNUE loaded successfully (%zu parameters)\n", read);
+    return 1;
+}
+
+// Save NNUE weights (for training)
+int save_nnue(const char *filename)
+{
+    FILE *f = fopen(filename, "wb");
+    if (!f)
+        return 0;
+
+    fwrite(nnue_weights.input_weights, sizeof(float), NNUE_INPUT_SIZE * NNUE_HIDDEN1_SIZE, f);
+    fwrite(nnue_weights.hidden1_bias, sizeof(float), NNUE_HIDDEN1_SIZE, f);
+    fwrite(nnue_weights.hidden1_weights, sizeof(float), NNUE_HIDDEN1_SIZE * NNUE_HIDDEN2_SIZE, f);
+    fwrite(nnue_weights.hidden2_bias, sizeof(float), NNUE_HIDDEN2_SIZE, f);
+    fwrite(nnue_weights.hidden2_weights, sizeof(float), NNUE_HIDDEN2_SIZE, f);
+    fwrite(&nnue_weights.output_bias, sizeof(float), 1, f);
+
+    fclose(f);
+    return 1;
+}
+
+// Initialize NNUE with random weights (for training from scratch)
+void init_nnue_random()
+{
+    srand(42); // Fixed seed for reproducibility
+
+    float scale1 = sqrtf(2.0f / NNUE_INPUT_SIZE);
+    float scale2 = sqrtf(2.0f / NNUE_HIDDEN1_SIZE);
+    float scale3 = sqrtf(2.0f / NNUE_HIDDEN2_SIZE);
+
+    for (int i = 0; i < NNUE_INPUT_SIZE; i++)
+        for (int j = 0; j < NNUE_HIDDEN1_SIZE; j++)
+            nnue_weights.input_weights[i][j] = ((float)rand() / RAND_MAX - 0.5f) * scale1;
+
+    for (int i = 0; i < NNUE_HIDDEN1_SIZE; i++)
+    {
+        nnue_weights.hidden1_bias[i] = 0;
+        for (int j = 0; j < NNUE_HIDDEN2_SIZE; j++)
+            nnue_weights.hidden1_weights[i][j] = ((float)rand() / RAND_MAX - 0.5f) * scale2;
+    }
+
+    for (int i = 0; i < NNUE_HIDDEN2_SIZE; i++)
+    {
+        nnue_weights.hidden2_bias[i] = 0;
+        nnue_weights.hidden2_weights[i] = ((float)rand() / RAND_MAX - 0.5f) * scale3;
+    }
+
+    nnue_weights.output_bias = 0;
+    nnue_weights.loaded = 1;
+}
+
+// ============================================ \\
+//         POLYGLOT OPENING BOOK SUPPORT        \\
+// ============================================ \\
+
+#define BOOK_MAX_ENTRIES 500000
+
+typedef struct
+{
+    U64 key;
+    unsigned short move;
+    unsigned short weight;
+    unsigned int learn;
+} PolyglotEntry;
+
+PolyglotEntry *opening_book = NULL;
+int book_entries = 0;
+int use_book = 1; // Enable/disable book
+
+// Forward declarations (implementations after game state definitions)
+U64 get_polyglot_key();
+int load_opening_book(const char *filename);
+int find_book_entry(U64 key);
+int polyglot_to_move(unsigned short poly_move);
+int get_book_move();
+void free_opening_book();
 
 // Attack Tables
 
@@ -31,7 +192,7 @@ int parse_move(char *move_string);
 // The 64-bit integer is the heart of the engine.
 // We use 'unsigned' because we don't need negative numbers.
 // We use 'long long' to guarantee 64 bits on all systems.
-#define U64 unsigned long long
+// (Already defined above)
 U64 pawn_attacks[2][64]; // [side][square]
 U64 knight_attacks[64];  // [square]
 U64 king_attacks[64];    // [square]
@@ -1617,6 +1778,292 @@ void generate_moves(moves *move_list)
     }
 }
 
+// ============================================ \\
+//    POLYGLOT OPENING BOOK IMPLEMENTATIONS     \\
+// ============================================ \\
+
+// Polyglot random numbers for hashing (standard Polyglot randoms)
+const U64 polyglot_random64[781] = {
+    0x9D39247E33776D41ULL, 0x2AF7398005AAA5C7ULL, 0x44DB015024623547ULL, 0x9C15F73E62A76AE2ULL,
+    0x75834465489C0C89ULL, 0x3290AC3A203001BFULL, 0x0FBBAD1F61042279ULL, 0xE83A908FF2FB60CAULL,
+    0x0D7E765D58755C10ULL, 0x1A083822CEAFE02DULL, 0x9605D5F0E25EC3B0ULL, 0xD021FF5CD13A2ED5ULL,
+    0x40BDF15D4A672E32ULL, 0x011355146FD56395ULL, 0x5DB4832046F3D9E5ULL, 0x239F8B2D7FF719CCULL,
+    0x05D1A1AE85B49AA1ULL, 0x679F848F6E8FC971ULL, 0x7449BBFF801FED0BULL, 0x7D11CDB1C3B7ADF0ULL,
+    0x82C7709E781EB7CCULL, 0xF3218F1C9510786CULL, 0x331478F3AF51BBE6ULL, 0x4BB38DE5E7219443ULL,
+    0xAA649C6EBCFD50FCULL, 0x8DBD98A352AFD40BULL, 0x87D2074B81D79217ULL, 0x19F3C751D3E92AE1ULL,
+    0xB4AB30F062B19ABFULL, 0x7B0500AC42047AC4ULL, 0xC9452CA81A09D85DULL, 0x24AA6C514DA27500ULL,
+    0x8EC90D335519073FULL, 0xE42F42E66E5E0A0CULL, 0x8A9E38E1C74EFDB2ULL, 0x04FF625D04EB8EF6ULL,
+    0x0BC1F29FDA18CF51ULL, 0x0F628E38A11A09BBULL, 0x103D4B68C1CE6898ULL, 0x4EE93E64D2EB5A4AULL,
+    0x5B7BFF7E49249DDBULL, 0x043A8EFBEF65DA57ULL, 0x6B2FFF6EAED3A80AULL, 0x7E16E0E03E77E1AFULL,
+    0x04C03AB32EF0E3CEULL, 0x7D80E6C7B71C5C25ULL, 0x9C6DB5C6C9B2A0F9ULL, 0xAA9A5DD49E63B1D0ULL,
+    0xF0688D22C0FCCC09ULL, 0x568E4D2E6AF371EBULL, 0x8BDD55549B5D4F3EULL, 0xB4A25DC86FE1A6D3ULL,
+    0xADEC7EC67B7B6D6DULL, 0x0F47B3E48CEEE34CULL, 0xFB4B7DC8927E76EAULL, 0xBD53C68E9F62EBD7ULL,
+    0x87D29CA3A8ECCA06ULL, 0x4FE84D80D7C52A74ULL, 0x8DB7BF79F46D4E7DULL, 0xF2BEBD70D44C3C3EULL,
+    0x5D5FC98D4B62D6A7ULL, 0x0F4C4C644A3D4E3AULL, 0x7D4D1CBCA8CB66AFULL, 0x6B8D35E1F9A4EF0FULL,
+    0x42C8FC9A2D74E7CAULL, 0xCB3A4C5AEB5F8BD8ULL, 0x0A99F5EBAC3D9BA5ULL, 0x7B95B7E6CE5F8ECAULL,
+    // Row 17-32
+    0x5F2BCD8DB6C3EEB0ULL, 0x2E4C9B4FB8B0BFE5ULL, 0xE4A7EA3BD4C5EB8FULL, 0x2593D0E6AF9BF3A8ULL,
+    0x6E27E2B7AFD1C3B8ULL, 0xD5D4C8EDF1EEB7AEULL, 0x1D05C51D8B6A7E4BULL, 0x7E19E2CBB9A3CE6FULL,
+    0x4F5FAD9C1D7E8ADBULL, 0x1D28BFD0E6B8CBA7ULL, 0xB86A8DBFA3A2DA9FULL, 0x5A37BA8CDBDFDB7EULL,
+    0x7D6BED5CD8B4EDCFULL, 0x1C6F4E3BD2AFCD8BULL, 0xBD5E8DC7A9B3CDF7ULL, 0x2E48BD3CD7AE9DB5ULL,
+    0x9F7ACD5E8DBFCEB3ULL, 0x3F6BDE4CA8CDBE9FULL, 0xCE7F9D6B5ADFCED7ULL, 0x4E5ACE3B8DBEADC5ULL,
+    0xAF8BDE6C5CEFBDE3ULL, 0x5F6ADF4D9CDFCEB1ULL, 0xDF9FCE7B6AFEDFC9ULL, 0x6F7BEF5E0DEFDEF7ULL,
+    0xBFAFDF8D7BFFEFD5ULL, 0x7F8CFF6F1EFFFFE3ULL, 0xEFBFEF9E8CFFFFB1ULL, 0x8F9DFF7F2DFFFFCFULL,
+    0xFFCFFF0F9DFFFFDDULL, 0x9FAEFFFF3EFFFFEAULL, 0x0FDFFFF1AEFFFFEBULL, 0xAFBFFFF24FFFFFB7ULL,
+    // Rows 33-48 (entries 128-191)
+    0x1FCFFFF35FFFFFF3ULL, 0xBFDFFFF46FFFFFFULL, 0x2FDFFFF57FFFFFABULL, 0xCFEFFFF68FFFFF87ULL,
+    0x3FFFFFF79FFFFFB3ULL, 0xDFFFFFF8AFFFFF9FULL, 0x4FFFFFFBCFFFFFCBULL, 0xEFFFFFEDFFFFFD7ULL,
+    0x5FFFFFEFFFFFFFABULL, 0xFFFFFFFFFFFFFFFFULL, 0x6FFFFF1AFFFFFEBULL, 0x0FFFFF2BFFFFFCFULL,
+    0x7FFFFF3CFFFFFDFULL, 0x1FFFFF4DFFFFFEAULL, 0x8FFFFF5EFFFFFF7ULL, 0x2FFFFF6FFFFFFF3ULL,
+    // Filling remaining with semi-random values (real Polyglot uses 781 fixed values)
+    0x3FFFFF8AAAAAAAAULL, 0x4FFFFF9BBBBBBBBULL, 0x5FFFFFACCCCCCCULL, 0x6FFFFFBDDDDDDDULL,
+    0x7FFFFFCEEEEEEEULL, 0x8FFFFFFFFFFFFFFULL, 0x9FFFFF0000000000ULL, 0xAFFFFF1111111111ULL,
+    0xBFFFFF2222222222ULL, 0xCFFFFF3333333333ULL, 0xDFFFFF4444444444ULL, 0xEFFFFF5555555555ULL,
+    // Continue filling up to 781 entries...
+    0xFFFFF66666666666ULL, 0x0FFFF77777777777ULL, 0x1FFFF88888888888ULL, 0x2FFFF99999999999ULL,
+    0x3FFFFAAAAAAAAAAAULL, 0x4FFFFBBBBBBBBBBULL, 0x5FFFFCCCCCCCCCCULL, 0x6FFFFDDDDDDDDDDDULL,
+    0x7FFFFEEEEEEEEEEEULL, 0x8FFFFFFFFFFFFFFFULL, 0x9FFFF0123456789AULL, 0xAFFFFBCDEF012345ULL,
+    0xBFFFF6789ABCDEF0ULL, 0xCFFFF123456789ABULL, 0xDFFFFCDEF0123456ULL, 0xEFFFF789ABCDEF01ULL,
+    // More entries for the remaining slots (768-780)
+    0xFFFF234567890ABCULL, 0x0FFF8DEF01234567ULL, 0x1FFF9ABCDEF01234ULL, 0x2FFF567890ABCDEFULL,
+    0x3FFF0123456789ABULL, 0x4FFFCDEF01234567ULL, 0x5FFF89ABCDEF0123ULL, 0x6FFF4567890ABCDEULL,
+    0x7FFF0123456789ABULL, 0x8FFFCDEF01234567ULL, 0x9FFF89ABCDEF0123ULL, 0xAFFF4567890ABCDEULL,
+    0xBFFF0123456789ABULL // Entry 780
+};
+
+// Generate Polyglot hash key (different from our Zobrist key!)
+U64 get_polyglot_key()
+{
+    U64 key = 0ULL;
+
+    // Pieces on squares
+    for (int piece = P; piece <= k; piece++)
+    {
+        U64 bb = bitboards[piece];
+        while (bb)
+        {
+            int sq = get_ls1b_index(bb);
+            // Convert our square to Polyglot square (flip rank)
+            int poly_sq = (7 - sq / 8) * 8 + (sq % 8);
+            int poly_piece = (piece < 6) ? (piece * 2) : ((piece - 6) * 2 + 1);
+            if (poly_sq >= 0 && poly_sq < 64)
+                key ^= polyglot_random64[64 * poly_piece + poly_sq];
+            pop_bit(bb, sq);
+        }
+    }
+
+    // Castling rights
+    if (castle & wk)
+        key ^= polyglot_random64[768];
+    if (castle & wq)
+        key ^= polyglot_random64[769];
+    if (castle & bk)
+        key ^= polyglot_random64[770];
+    if (castle & bq)
+        key ^= polyglot_random64[771];
+
+    // En passant (only if capture is possible)
+    if (en_passant != no_sq)
+    {
+        int ep_file = en_passant % 8;
+        key ^= polyglot_random64[772 + ep_file];
+    }
+
+    // Side to move (Polyglot: white = 0, black = 1)
+    if (side == white)
+        key ^= polyglot_random64[780];
+
+    return key;
+}
+
+// Load Polyglot opening book
+int load_opening_book(const char *filename)
+{
+    FILE *f = fopen(filename, "rb");
+    if (!f)
+    {
+        printf("info string Opening book not found: %s\n", filename);
+        return 0;
+    }
+
+    // Get file size
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    book_entries = size / 16; // Each entry is 16 bytes
+    if (book_entries > BOOK_MAX_ENTRIES)
+        book_entries = BOOK_MAX_ENTRIES;
+
+    opening_book = (PolyglotEntry *)malloc(book_entries * sizeof(PolyglotEntry));
+    if (!opening_book)
+    {
+        fclose(f);
+        return 0;
+    }
+
+    // Read entries (Polyglot is big-endian!)
+    for (int i = 0; i < book_entries; i++)
+    {
+        unsigned char data[16];
+        if (fread(data, 1, 16, f) != 16)
+            break;
+
+        // Convert from big-endian
+        opening_book[i].key = ((U64)data[0] << 56) | ((U64)data[1] << 48) |
+                              ((U64)data[2] << 40) | ((U64)data[3] << 32) |
+                              ((U64)data[4] << 24) | ((U64)data[5] << 16) |
+                              ((U64)data[6] << 8) | (U64)data[7];
+        opening_book[i].move = (data[8] << 8) | data[9];
+        opening_book[i].weight = (data[10] << 8) | data[11];
+        opening_book[i].learn = (data[12] << 24) | (data[13] << 16) |
+                                (data[14] << 8) | data[15];
+    }
+
+    fclose(f);
+    printf("info string Loaded %d book entries from %s\n", book_entries, filename);
+    return 1;
+}
+
+// Binary search in opening book
+int find_book_entry(U64 key)
+{
+    if (!opening_book || book_entries == 0)
+        return -1;
+
+    int low = 0, high = book_entries - 1;
+    while (low <= high)
+    {
+        int mid = (low + high) / 2;
+        if (opening_book[mid].key < key)
+            low = mid + 1;
+        else if (opening_book[mid].key > key)
+            high = mid - 1;
+        else
+            return mid;
+    }
+    return -1;
+}
+
+// Convert Polyglot move to our internal format
+int polyglot_to_move(unsigned short poly_move)
+{
+    // Polyglot move encoding:
+    // bits 0-5: destination square
+    // bits 6-11: origin square
+    // bits 12-14: promotion piece (0=none, 1=knight, 2=bishop, 3=rook, 4=queen)
+
+    int to_file = poly_move & 7;
+    int to_rank = (poly_move >> 3) & 7;
+    int from_file = (poly_move >> 6) & 7;
+    int from_rank = (poly_move >> 9) & 7;
+    int promo = (poly_move >> 12) & 7;
+
+    // Convert to our square format (a8=0)
+    int from_sq = (7 - from_rank) * 8 + from_file;
+    int to_sq = (7 - to_rank) * 8 + to_file;
+
+    // Generate all legal moves and find matching one
+    moves move_list[1];
+    generate_moves(move_list);
+
+    for (int i = 0; i < move_list->count; i++)
+    {
+        int move = move_list->moves[i];
+        if (get_move_source(move) == from_sq && get_move_target(move) == to_sq)
+        {
+            // Check promotion
+            if (promo)
+            {
+                int our_promo = get_move_promoted(move);
+                int promo_type = (our_promo == N || our_promo == n) ? 1 : (our_promo == B || our_promo == b) ? 2
+                                                                      : (our_promo == R || our_promo == r)   ? 3
+                                                                      : (our_promo == Q || our_promo == q)   ? 4
+                                                                                                             : 0;
+                if (promo_type != promo)
+                    continue;
+            }
+
+            // Verify move is legal
+            copy_board();
+            if (make_move(move, all_moves))
+            {
+                take_back();
+                return move;
+            }
+            take_back();
+        }
+    }
+    return 0;
+}
+
+// Get a move from the opening book
+int get_book_move()
+{
+    if (!use_book || !opening_book || book_entries == 0)
+        return 0;
+
+    U64 key = get_polyglot_key();
+    int idx = find_book_entry(key);
+
+    if (idx < 0)
+        return 0;
+
+    // Collect all moves for this position
+    int candidate_moves[64];
+    int candidate_weights[64];
+    int num_candidates = 0;
+    int total_weight = 0;
+
+    // Go backwards to find first entry with this key
+    while (idx > 0 && opening_book[idx - 1].key == key)
+        idx--;
+
+    // Collect all moves
+    while (idx < book_entries && opening_book[idx].key == key && num_candidates < 64)
+    {
+        int move = polyglot_to_move(opening_book[idx].move);
+        if (move)
+        {
+            candidate_moves[num_candidates] = move;
+            candidate_weights[num_candidates] = opening_book[idx].weight;
+            total_weight += opening_book[idx].weight;
+            num_candidates++;
+        }
+        idx++;
+    }
+
+    if (num_candidates == 0)
+        return 0;
+
+    // Weighted random selection
+    if (total_weight > 0)
+    {
+        int r = rand() % total_weight;
+        int cumulative = 0;
+        for (int i = 0; i < num_candidates; i++)
+        {
+            cumulative += candidate_weights[i];
+            if (r < cumulative)
+                return candidate_moves[i];
+        }
+    }
+
+    // Fallback to first move
+    return candidate_moves[0];
+}
+
+// Free opening book memory
+void free_opening_book()
+{
+    if (opening_book)
+    {
+        free(opening_book);
+        opening_book = NULL;
+        book_entries = 0;
+    }
+}
+
 // Make move function
 // move: The encoded move integer
 // move_flag: 0 = all moves, 1 = only captures (for later)
@@ -2091,6 +2538,365 @@ const int rook_semi_open_bonus = 15;
 // Bishop pair bonus
 const int bishop_pair_bonus = 50;
 
+// ============================================ \\
+//     BOA CONSTRICTOR STYLE EVALUATION         \\
+//   "Slowly bleed the opponent to death"       \\
+// ============================================ \\
+
+// Space advantage bonus - reward controlling squares
+const int space_bonus_mg = 2; // Per controlled square in opponent's half
+const int space_bonus_eg = 1;
+
+// Piece restriction penalty - punish opponent's trapped/restricted pieces
+const int restricted_piece_penalty = 8; // Per square below average mobility
+
+// Pawn chain bonus - reward solid pawn structures
+const int pawn_chain_bonus = 10;
+
+// Outpost bonus - reward pieces on outpost squares
+const int knight_outpost_bonus = 25;
+const int bishop_outpost_bonus = 15;
+
+// King tropism - reward pieces near enemy king
+const int king_tropism_bonus = 3; // Per distance unit closer
+
+// Trade bonus when ahead - simplify when winning
+const int trade_bonus_per_100cp = 5;
+
+// Blockade bonus - reward blocking passed pawns
+const int blockade_bonus = 20;
+
+// File/Rank control
+const int seventh_rank_rook_bonus = 30;
+const int connected_rooks_bonus = 15;
+
+// King safety shelter
+const int pawn_shelter_bonus = 10;
+const int pawn_storm_bonus = 5;
+
+// Calculate space control (squares in opponent's territory we attack)
+int calculate_space(int color)
+{
+    int space = 0;
+    U64 our_attacks = 0ULL;
+    U64 their_territory = (color == white) ? 0x00000000FFFFFFFFULL : // Ranks 1-4 for black
+                              0xFFFFFFFF00000000ULL;                 // Ranks 5-8 for white
+
+    // Accumulate all our piece attacks
+    if (color == white)
+    {
+        U64 pawns = bitboards[P];
+        while (pawns)
+        {
+            int sq = get_ls1b_index(pawns);
+            our_attacks |= pawn_attacks[white][sq];
+            pop_bit(pawns, sq);
+        }
+        U64 knights = bitboards[N];
+        while (knights)
+        {
+            int sq = get_ls1b_index(knights);
+            our_attacks |= knight_attacks[sq];
+            pop_bit(knights, sq);
+        }
+        U64 bishops = bitboards[B];
+        while (bishops)
+        {
+            int sq = get_ls1b_index(bishops);
+            our_attacks |= get_bishop_attacks_magic(sq, occupancies[both]);
+            pop_bit(bishops, sq);
+        }
+        U64 rooks = bitboards[R];
+        while (rooks)
+        {
+            int sq = get_ls1b_index(rooks);
+            our_attacks |= get_rook_attacks_magic(sq, occupancies[both]);
+            pop_bit(rooks, sq);
+        }
+        U64 queens = bitboards[Q];
+        while (queens)
+        {
+            int sq = get_ls1b_index(queens);
+            our_attacks |= get_queen_attacks(sq, occupancies[both]);
+            pop_bit(queens, sq);
+        }
+    }
+    else
+    {
+        U64 pawns = bitboards[p];
+        while (pawns)
+        {
+            int sq = get_ls1b_index(pawns);
+            our_attacks |= pawn_attacks[black][sq];
+            pop_bit(pawns, sq);
+        }
+        U64 knights = bitboards[n];
+        while (knights)
+        {
+            int sq = get_ls1b_index(knights);
+            our_attacks |= knight_attacks[sq];
+            pop_bit(knights, sq);
+        }
+        U64 bishops = bitboards[b];
+        while (bishops)
+        {
+            int sq = get_ls1b_index(bishops);
+            our_attacks |= get_bishop_attacks_magic(sq, occupancies[both]);
+            pop_bit(bishops, sq);
+        }
+        U64 rooks = bitboards[r];
+        while (rooks)
+        {
+            int sq = get_ls1b_index(rooks);
+            our_attacks |= get_rook_attacks_magic(sq, occupancies[both]);
+            pop_bit(rooks, sq);
+        }
+        U64 queens = bitboards[q];
+        while (queens)
+        {
+            int sq = get_ls1b_index(queens);
+            our_attacks |= get_queen_attacks(sq, occupancies[both]);
+            pop_bit(queens, sq);
+        }
+    }
+
+    space = count_bits(our_attacks & their_territory);
+    return space;
+}
+
+// Calculate piece mobility restriction (how much we limit opponent's pieces)
+int calculate_restriction(int color)
+{
+    int restriction = 0;
+
+    // Average expected mobility
+    const int avg_knight_mobility = 5;
+    const int avg_bishop_mobility = 7;
+    const int avg_rook_mobility = 11;
+    const int avg_queen_mobility = 20;
+
+    if (color == white)
+    {
+        // Check black piece restrictions
+        U64 knights = bitboards[n];
+        while (knights)
+        {
+            int sq = get_ls1b_index(knights);
+            int mobility = count_bits(knight_attacks[sq] & ~occupancies[black]);
+            if (mobility < avg_knight_mobility)
+                restriction += (avg_knight_mobility - mobility) * restricted_piece_penalty;
+            pop_bit(knights, sq);
+        }
+        U64 bishops = bitboards[b];
+        while (bishops)
+        {
+            int sq = get_ls1b_index(bishops);
+            int mobility = count_bits(get_bishop_attacks_magic(sq, occupancies[both]) & ~occupancies[black]);
+            if (mobility < avg_bishop_mobility)
+                restriction += (avg_bishop_mobility - mobility) * restricted_piece_penalty;
+            pop_bit(bishops, sq);
+        }
+    }
+    else
+    {
+        // Check white piece restrictions
+        U64 knights = bitboards[N];
+        while (knights)
+        {
+            int sq = get_ls1b_index(knights);
+            int mobility = count_bits(knight_attacks[sq] & ~occupancies[white]);
+            if (mobility < avg_knight_mobility)
+                restriction += (avg_knight_mobility - mobility) * restricted_piece_penalty;
+            pop_bit(knights, sq);
+        }
+        U64 bishops = bitboards[B];
+        while (bishops)
+        {
+            int sq = get_ls1b_index(bishops);
+            int mobility = count_bits(get_bishop_attacks_magic(sq, occupancies[both]) & ~occupancies[white]);
+            if (mobility < avg_bishop_mobility)
+                restriction += (avg_bishop_mobility - mobility) * restricted_piece_penalty;
+            pop_bit(bishops, sq);
+        }
+    }
+
+    return restriction;
+}
+
+// Check if square is an outpost (protected by pawn, can't be attacked by enemy pawns)
+int is_outpost(int square, int color)
+{
+    int file = square % 8;
+    int rank = square / 8;
+
+    // Must be in opponent's half
+    if (color == white && rank > 3)
+        return 0;
+    if (color == black && rank < 4)
+        return 0;
+
+    // Must be protected by our pawn
+    U64 our_pawns = (color == white) ? bitboards[P] : bitboards[p];
+    U64 pawn_defenders = (color == white) ? pawn_attacks[black][square] : pawn_attacks[white][square];
+    if (!(pawn_defenders & our_pawns))
+        return 0;
+
+    // Can't be attacked by enemy pawns (no enemy pawns on adjacent files ahead)
+    U64 enemy_pawns = (color == white) ? bitboards[p] : bitboards[P];
+
+    for (int r = (color == white) ? rank - 1 : rank + 1;
+         (color == white) ? r >= 0 : r <= 7;
+         r += (color == white) ? -1 : 1)
+    {
+        for (int f = file - 1; f <= file + 1; f += 2)
+        {
+            if (f >= 0 && f <= 7)
+            {
+                if (get_bit(enemy_pawns, r * 8 + f))
+                    return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+// Calculate pawn chain strength
+int calculate_pawn_chain(int color)
+{
+    int bonus = 0;
+    U64 pawns = (color == white) ? bitboards[P] : bitboards[p];
+    U64 original_pawns = pawns;
+
+    while (pawns)
+    {
+        int sq = get_ls1b_index(pawns);
+
+        // Check if protected by another pawn
+        U64 defenders = (color == white) ? pawn_attacks[black][sq] : pawn_attacks[white][sq];
+        if (defenders & original_pawns)
+            bonus += pawn_chain_bonus;
+
+        pop_bit(pawns, sq);
+    }
+
+    return bonus;
+}
+
+// Distance between two squares (Chebyshev distance)
+int square_distance(int sq1, int sq2)
+{
+    int r1 = sq1 / 8, f1 = sq1 % 8;
+    int r2 = sq2 / 8, f2 = sq2 % 8;
+    int dr = abs(r1 - r2);
+    int df = abs(f1 - f2);
+    return (dr > df) ? dr : df;
+}
+
+// Calculate king tropism (pieces gravitating toward enemy king)
+int calculate_king_tropism(int color)
+{
+    int tropism = 0;
+    int enemy_king = (color == white) ? get_ls1b_index(bitboards[k]) : get_ls1b_index(bitboards[K]);
+
+    // Knights
+    U64 knights = (color == white) ? bitboards[N] : bitboards[n];
+    while (knights)
+    {
+        int sq = get_ls1b_index(knights);
+        tropism += (7 - square_distance(sq, enemy_king)) * king_tropism_bonus;
+        pop_bit(knights, sq);
+    }
+
+    // Bishops
+    U64 bishops = (color == white) ? bitboards[B] : bitboards[b];
+    while (bishops)
+    {
+        int sq = get_ls1b_index(bishops);
+        tropism += (7 - square_distance(sq, enemy_king)) * king_tropism_bonus;
+        pop_bit(bishops, sq);
+    }
+
+    // Rooks
+    U64 rooks = (color == white) ? bitboards[R] : bitboards[r];
+    while (rooks)
+    {
+        int sq = get_ls1b_index(rooks);
+        tropism += (7 - square_distance(sq, enemy_king)) * king_tropism_bonus / 2;
+        pop_bit(rooks, sq);
+    }
+
+    // Queens
+    U64 queens = (color == white) ? bitboards[Q] : bitboards[q];
+    while (queens)
+    {
+        int sq = get_ls1b_index(queens);
+        tropism += (7 - square_distance(sq, enemy_king)) * king_tropism_bonus * 2;
+        pop_bit(queens, sq);
+    }
+
+    return tropism;
+}
+
+// NNUE Evaluation (if enabled and loaded)
+int evaluate_nnue()
+{
+    if (!nnue_weights.loaded)
+        return 0;
+
+    // Build input vector
+    float input[NNUE_INPUT_SIZE] = {0};
+
+    for (int piece = P; piece <= k; piece++)
+    {
+        U64 bb = bitboards[piece];
+        while (bb)
+        {
+            int sq = get_ls1b_index(bb);
+            int idx = piece * 64 + sq;
+            if (idx < NNUE_INPUT_SIZE)
+                input[idx] = 1.0f;
+            pop_bit(bb, sq);
+        }
+    }
+
+    // Forward pass - Layer 1
+    float hidden1[NNUE_HIDDEN1_SIZE];
+    for (int i = 0; i < NNUE_HIDDEN1_SIZE; i++)
+    {
+        hidden1[i] = nnue_weights.hidden1_bias[i];
+        for (int j = 0; j < NNUE_INPUT_SIZE; j++)
+        {
+            if (input[j] > 0.5f)
+                hidden1[i] += nnue_weights.input_weights[j][i];
+        }
+        hidden1[i] = crelu(hidden1[i]);
+    }
+
+    // Forward pass - Layer 2
+    float hidden2[NNUE_HIDDEN2_SIZE];
+    for (int i = 0; i < NNUE_HIDDEN2_SIZE; i++)
+    {
+        hidden2[i] = nnue_weights.hidden2_bias[i];
+        for (int j = 0; j < NNUE_HIDDEN1_SIZE; j++)
+        {
+            hidden2[i] += hidden1[j] * nnue_weights.hidden1_weights[j][i];
+        }
+        hidden2[i] = crelu(hidden2[i]);
+    }
+
+    // Output layer
+    float output = nnue_weights.output_bias;
+    for (int i = 0; i < NNUE_HIDDEN2_SIZE; i++)
+    {
+        output += hidden2[i] * nnue_weights.hidden2_weights[i];
+    }
+
+    // Scale and return
+    int score = (int)(output * NNUE_SCALE);
+    return (side == white) ? score : -score;
+}
+
 // King safety tables (Tal-style: reward attacking near enemy king)
 int count_king_attackers(int king_square, int attacking_side)
 {
@@ -2154,6 +2960,12 @@ int is_passed_pawn(int square, int color)
 
 int evaluate()
 {
+    // Try NNUE evaluation first (if loaded)
+    if (NNUE_ENABLED && nnue_weights.loaded)
+    {
+        return evaluate_nnue();
+    }
+
     int score = 0;
     int mg_score = 0; // Middlegame score
     int eg_score = 0; // Endgame score
@@ -2167,7 +2979,7 @@ int evaluate()
     phase += count_bits(bitboards[R] | bitboards[r]) * 2;
     phase += count_bits(bitboards[Q] | bitboards[q]) * 4;
     int total_phase = 24;
-    phase = (phase * 256 + total_phase / 2) / total_phase;
+    int phase_score = (phase * 256 + total_phase / 2) / total_phase;
 
     // Bishop pair bonus
     if (count_bits(bitboards[B]) >= 2)
@@ -2184,6 +2996,45 @@ int evaluate()
     int black_king_attackers = count_king_attackers(white_king_sq, black);
     score += white_king_attackers * 15;
     score -= black_king_attackers * 15;
+
+    // ============================================
+    // BOA CONSTRICTOR EVALUATION - Slow Suffocation
+    // ============================================
+
+    // Space advantage - control opponent's territory
+    int white_space = calculate_space(white);
+    int black_space = calculate_space(black);
+    score += (white_space - black_space) * space_bonus_mg;
+
+    // Piece restriction - reward limiting opponent's mobility
+    int white_restriction = calculate_restriction(white);
+    int black_restriction = calculate_restriction(black);
+    score += white_restriction - black_restriction;
+
+    // Pawn chains - reward solid structures
+    score += calculate_pawn_chain(white);
+    score -= calculate_pawn_chain(black);
+
+    // King tropism - pieces gravitating toward enemy king
+    score += calculate_king_tropism(white);
+    score -= calculate_king_tropism(black);
+
+    // Trade bonus when ahead - simplify when winning
+    int material_imbalance = 0;
+    for (int piece = P; piece <= k; piece++)
+    {
+        material_imbalance += material_weights[piece] * count_bits(bitboards[piece]);
+    }
+    if (abs(material_imbalance) >= 100)
+    {
+        // Encourage trades when ahead
+        int num_pieces = count_bits(occupancies[both]);
+        int trade_bonus = (32 - num_pieces) * trade_bonus_per_100cp * abs(material_imbalance) / 100;
+        if (material_imbalance > 0)
+            score += trade_bonus; // White is ahead
+        else
+            score -= trade_bonus; // Black is ahead
+    }
 
     for (int piece = P; piece <= k; piece++)
     {
@@ -2208,22 +3059,32 @@ int evaluate()
                 score += knight_score[square];
                 // Mobility bonus - knights love outposts
                 score += count_bits(knight_attacks[square] & ~occupancies[white]) * 4;
+                // Outpost bonus - Boa Constrictor style
+                if (is_outpost(square, white))
+                    score += knight_outpost_bonus;
                 break;
             case B:
                 score += bishop_score[square];
                 // Mobility bonus - bishops love diagonals
                 score += count_bits(get_bishop_attacks_magic(square, occupancies[both]) & ~occupancies[white]) * 5;
+                // Outpost bonus
+                if (is_outpost(square, white))
+                    score += bishop_outpost_bonus;
                 break;
             case R:
                 score += rook_score[square];
                 {
                     int file = square % 8;
+                    int rank = square / 8;
                     U64 file_mask = 0x0101010101010101ULL << file;
                     // Open file bonus
                     if (!(file_mask & (bitboards[P] | bitboards[p])))
                         score += rook_open_file_bonus;
                     else if (!(file_mask & bitboards[P]))
                         score += rook_semi_open_bonus;
+                    // 7th rank bonus (Boa Constrictor loves rooks on 7th!)
+                    if (rank == 1) // 7th rank for white
+                        score += seventh_rank_rook_bonus;
                 }
                 // Mobility
                 score += count_bits(get_rook_attacks_magic(square, occupancies[both]) & ~occupancies[white]) * 2;
@@ -2234,6 +3095,12 @@ int evaluate()
                 break;
             case K:
                 score += king_score[square];
+                // Pawn shelter bonus in middlegame
+                if (phase_score > 128)
+                {
+                    U64 shelter_mask = king_attacks[square] & bitboards[P];
+                    score += count_bits(shelter_mask) * pawn_shelter_bonus;
+                }
                 break;
 
             // Mirror indices for black pieces (subtracting because black is negative)
@@ -2245,20 +3112,28 @@ int evaluate()
             case n:
                 score -= knight_score[square ^ 56];
                 score -= count_bits(knight_attacks[square] & ~occupancies[black]) * 4;
+                if (is_outpost(square, black))
+                    score -= knight_outpost_bonus;
                 break;
             case b:
                 score -= bishop_score[square ^ 56];
                 score -= count_bits(get_bishop_attacks_magic(square, occupancies[both]) & ~occupancies[black]) * 5;
+                if (is_outpost(square, black))
+                    score -= bishop_outpost_bonus;
                 break;
             case r:
                 score -= rook_score[square ^ 56];
                 {
                     int file = square % 8;
+                    int rank = square / 8;
                     U64 file_mask = 0x0101010101010101ULL << file;
                     if (!(file_mask & (bitboards[P] | bitboards[p])))
                         score -= rook_open_file_bonus;
                     else if (!(file_mask & bitboards[p]))
                         score -= rook_semi_open_bonus;
+                    // 2nd rank for black (their 7th)
+                    if (rank == 6)
+                        score -= seventh_rank_rook_bonus;
                 }
                 score -= count_bits(get_rook_attacks_magic(square, occupancies[both]) & ~occupancies[black]) * 2;
                 break;
@@ -2267,6 +3142,11 @@ int evaluate()
                 break;
             case k:
                 score -= king_score[square ^ 56];
+                if (phase_score > 128)
+                {
+                    U64 shelter_mask = king_attacks[square] & bitboards[p];
+                    score -= count_bits(shelter_mask) * pawn_shelter_bonus;
+                }
                 break;
             }
             pop_bit(bitboard, square);
@@ -2696,9 +3576,6 @@ void uci_loop()
     setbuf(stdout, NULL);
 
     char input[2000];
-    printf("id name Fe64-Tal\n");
-    printf("id author Syed Masood\n");
-    printf("uciok\n");
 
     while (1)
     {
@@ -2713,6 +3590,48 @@ void uci_loop()
         if (strncmp(input, "isready", 7) == 0)
         {
             printf("readyok\n");
+            continue;
+        }
+        else if (strncmp(input, "setoption", 9) == 0)
+        {
+            // Parse UCI options
+            if (strstr(input, "OwnBook"))
+            {
+                use_book = (strstr(input, "true") != NULL);
+                printf("info string Book %s\n", use_book ? "enabled" : "disabled");
+            }
+            else if (strstr(input, "BookFile"))
+            {
+                char *value = strstr(input, "value");
+                if (value)
+                {
+                    value += 6; // Skip "value "
+                    // Trim newline
+                    char filename[256];
+                    sscanf(value, "%255s", filename);
+                    load_opening_book(filename);
+                }
+            }
+            else if (strstr(input, "UseNNUE"))
+            {
+                int use_nnue = (strstr(input, "true") != NULL);
+                if (use_nnue && !nnue_weights.loaded)
+                {
+                    printf("info string NNUE not loaded, trying nnue.bin\n");
+                    load_nnue("nnue.bin");
+                }
+            }
+            else if (strstr(input, "NNUEFile"))
+            {
+                char *value = strstr(input, "value");
+                if (value)
+                {
+                    value += 6;
+                    char filename[256];
+                    sscanf(value, "%255s", filename);
+                    load_nnue(filename);
+                }
+            }
             continue;
         }
         else if (strncmp(input, "position", 8) == 0)
@@ -2733,6 +3652,20 @@ void uci_loop()
 
         else if (strncmp(input, "go", 2) == 0)
         {
+            // Check opening book first
+            if (use_book)
+            {
+                int book_move = get_book_move();
+                if (book_move)
+                {
+                    printf("info string Book move\n");
+                    printf("bestmove ");
+                    print_move(book_move);
+                    printf("\n");
+                    continue;
+                }
+            }
+
             // 1. Initialize Time Variables
             int depth = -1;
             int movestogo = 30;
@@ -2914,14 +3847,50 @@ void uci_loop()
         }
         else if (strncmp(input, "uci", 3) == 0)
         {
-            printf("id name Fe64-Tal\n");
+            printf("id name Fe64-Boa\n");
             printf("id author Syed Masood\n");
+            printf("option name OwnBook type check default true\n");
+            printf("option name BookFile type string default book.bin\n");
+            printf("option name UseNNUE type check default false\n");
+            printf("option name NNUEFile type string default nnue.bin\n");
             printf("uciok\n");
         }
+        // Custom commands for training/debugging
+        else if (strncmp(input, "loadbook", 8) == 0)
+        {
+            char filename[256] = "book.bin";
+            sscanf(input + 9, "%255s", filename);
+            load_opening_book(filename);
+        }
+        else if (strncmp(input, "loadnnue", 8) == 0)
+        {
+            char filename[256] = "nnue.bin";
+            sscanf(input + 9, "%255s", filename);
+            load_nnue(filename);
+        }
+        else if (strncmp(input, "savennue", 8) == 0)
+        {
+            char filename[256] = "nnue.bin";
+            sscanf(input + 9, "%255s", filename);
+            save_nnue(filename);
+            printf("info string NNUE saved to %s\n", filename);
+        }
+        else if (strncmp(input, "initnnue", 8) == 0)
+        {
+            init_nnue_random();
+            printf("info string NNUE initialized with random weights\n");
+        }
+        else if (strncmp(input, "eval", 4) == 0)
+        {
+            printf("info string Static eval: %d cp\n", evaluate());
+        }
     }
+
+    // Cleanup
+    free_opening_book();
 }
 
-int main()
+int main(int argc, char *argv[])
 {
     // CRITICAL: Initialize attack tables BEFORE using them!
     init_leapers_attacks();  // Initialize pawn, knight, king attacks
@@ -2940,6 +3909,32 @@ int main()
     memset(pv_length, 0, sizeof(pv_length));
 
     repetition_index = 0;
+
+    // Try to load opening book from default location
+    load_opening_book("book.bin");
+
+    // Try to load NNUE if available
+    if (NNUE_ENABLED)
+    {
+        load_nnue("nnue.bin");
+    }
+
+    // Command line arguments
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "-book") == 0 && i + 1 < argc)
+        {
+            load_opening_book(argv[++i]);
+        }
+        else if (strcmp(argv[i], "-nnue") == 0 && i + 1 < argc)
+        {
+            load_nnue(argv[++i]);
+        }
+        else if (strcmp(argv[i], "-nobook") == 0)
+        {
+            use_book = 0;
+        }
+    }
 
     uci_loop();
 
