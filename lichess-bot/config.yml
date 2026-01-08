@@ -1,0 +1,51 @@
+url: "https://lichess.org"
+token: "lip_QMZJKSsJ6HsihDgP7BgK"
+
+engine:
+  dir: "/home/syedmasoodhussain/Desktop/chess_engine/bin/"
+  name: "bbc"
+  protocol: "uci"
+
+  # ONLY use options your engine actually supports!
+  # Hash and Threads are removed because your code doesn't declare them yet.
+  uci_options:
+    OwnBook: true
+
+matchmaking:
+  allow_matchmaking: true
+  challenge_variant: "standard"
+  challenge_timeout: 0
+  max_initial_time: 1800
+  min_initial_time: 0
+  # SEARCH FOR EVERYTHING: 1m, 2m, 3m, 5m, 10m
+  challenge_initial_time:
+    - 60
+    - 120
+    - 180
+    - 300
+    - 600
+  # INCREMENTS: 0s, 1s, 2s, 3s, 5s
+  challenge_increment:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 5
+
+challenge:
+  concurrency: 1
+  sort_by: "best"
+  accept_bot: true
+  only_bot: false
+  accept_guest: true
+  max_increment: 180
+  min_increment: 0
+  variants:
+    - standard
+  time_controls:
+    - bullet
+    - blitz
+    - rapid
+    - classical
+  modes:
+    - rated
