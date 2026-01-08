@@ -2505,7 +2505,7 @@ void parse_position(char *command)
     }
 
     // 5. Update Board State
-    print_board();
+    // print_board();
 }
 
 // -------------------------------------------- \\
@@ -3009,7 +3009,8 @@ int evaluate()
     // Piece restriction - reward limiting opponent's mobility
     int white_restriction = calculate_restriction(white);
     int black_restriction = calculate_restriction(black);
-    score += white_restriction - black_restriction;
+    score -= white_restriction;
+    score += black_restriction;
 
     // Pawn chains - reward solid structures
     score += calculate_pawn_chain(white);
@@ -3637,9 +3638,10 @@ void uci_loop()
         else if (strncmp(input, "position", 8) == 0)
         {
             parse_position(input);
-            // Reset repetition tracking for new position
-            repetition_index = 0;
-            repetition_table[repetition_index] = hash_key;
+            // Causing 3 Fold Repetions
+            // // Reset repetition tracking for new position
+            // repetition_index = 0;
+            // repetition_table[repetition_index] = hash_key;
         }
         else if (strncmp(input, "ucinewgame", 10) == 0)
         {
