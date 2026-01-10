@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <math.h>
+#include <pthread.h>
 
 // ============================================ \\
 //         NEURAL NETWORK (NNUE) CONFIG         \\
@@ -188,6 +189,9 @@ int make_move(int move, int move_flag);
 void print_board();
 void parse_fen(char *fen);
 int parse_move(char *move_string);
+int count_bits(U64 bitboard);
+int get_ls1b_index(U64 bitboard);
+int evaluate();
 
 // The 64-bit integer is the heart of the engine.
 // We use 'unsigned' because we don't need negative numbers.
@@ -232,6 +236,35 @@ int pv_table[MAX_PLY][MAX_PLY];
 
 // Late Move Reduction table
 int lmr_table[MAX_PLY][64];
+
+// ============================================ \\
+//       ADVANCED SEARCH IMPROVEMENTS           \\
+// ============================================ \\
+
+// Counter-move heuristic [piece][target_square] = counter_move
+int counter_moves[12][64];
+
+// History bonus/malus for butterfly history
+int butterfly_history[2][64][64]; // [side][from][to]
+
+// Static Exchange Evaluation piece values
+const int see_piece_values[12] = {
+    100, 320, 330, 500, 900, 20000, // White
+    100, 320, 330, 500, 900, 20000  // Black
+};
+
+// Contempt factor - avoid draws when stronger
+int contempt = 10; // centipawns
+
+// Late Move Pruning margins
+const int lmp_margins[4] = {0, 8, 12, 24};
+
+// Futility pruning margins by depth
+const int futility_margins[7] = {0, 100, 200, 300, 400, 500, 600};
+
+// UCI configurable options
+int hash_size_mb = 64; // Default 64 MB hash table
+int multi_pv = 1;      // Number of principal variations to search
 
 // Initialize LMR table
 void init_lmr_table()
@@ -461,6 +494,20 @@ const int king_score[64] = {
     20, 20, 0, 0, 0, 0, 20, 20,
     20, 30, 10, 0, 0, 10, 30, 20};
 
+// ENDGAME King PST - King should centralize in endgames!
+const int king_endgame_score[64] = {
+    -50, -40, -30, -20, -20, -30, -40, -50,
+    -30, -20, -10, 0, 0, -10, -20, -30,
+    -30, -10, 20, 30, 30, 20, -10, -30,
+    -30, -10, 30, 40, 40, 30, -10, -30,
+    -30, -10, 30, 40, 40, 30, -10, -30,
+    -30, -10, 20, 30, 30, 20, -10, -30,
+    -30, -30, 0, 0, 0, 0, -30, -30,
+    -50, -30, -30, -30, -30, -30, -30, -50};
+
+// Enhanced passed pawn bonus by rank (much stronger in endgame)
+const int passed_pawn_bonus_eg[8] = {0, 200, 150, 100, 60, 30, 15, 0};
+
 // -------------------------------------------- \\
 //             BITWISE MACROS                   \\
 // -------------------------------------------- \\
@@ -591,14 +638,168 @@ static int mvv_lva[12][12] = {
     {100, 200, 300, 400, 500, 600, 100, 200, 300, 400, 500, 600}, // k
 };
 
+// ============================================ \\
+//   STATIC EXCHANGE EVALUATION (SEE)           \\
+//   Determines if a capture sequence is good   \\
+// ============================================ \\
+
+// Get smallest attacker to a square
+int get_smallest_attacker(int square, int attacker_side, int *attacker_piece)
+{
+    int start_piece, end_piece;
+
+    if (attacker_side == white)
+    {
+        start_piece = P;
+        end_piece = K;
+    }
+    else
+    {
+        start_piece = p;
+        end_piece = k;
+    }
+
+    // Check pawns first (smallest)
+    if (attacker_side == white)
+    {
+        if (pawn_attacks[white][square] & bitboards[P])
+        {
+            *attacker_piece = P;
+            return get_ls1b_index(pawn_attacks[white][square] & bitboards[P]);
+        }
+    }
+    else
+    {
+        if (pawn_attacks[black][square] & bitboards[p])
+        {
+            *attacker_piece = p;
+            return get_ls1b_index(pawn_attacks[black][square] & bitboards[p]);
+        }
+    }
+
+    // Knights
+    int knight_piece = (attacker_side == white) ? N : n;
+    if (knight_attacks[square] & bitboards[knight_piece])
+    {
+        *attacker_piece = knight_piece;
+        return get_ls1b_index(knight_attacks[square] & bitboards[knight_piece]);
+    }
+
+    // Bishops
+    int bishop_piece = (attacker_side == white) ? B : b;
+    U64 bishop_atks = get_bishop_attacks_magic(square, occupancies[both]);
+    if (bishop_atks & bitboards[bishop_piece])
+    {
+        *attacker_piece = bishop_piece;
+        return get_ls1b_index(bishop_atks & bitboards[bishop_piece]);
+    }
+
+    // Rooks
+    int rook_piece = (attacker_side == white) ? R : r;
+    U64 rook_atks = get_rook_attacks_magic(square, occupancies[both]);
+    if (rook_atks & bitboards[rook_piece])
+    {
+        *attacker_piece = rook_piece;
+        return get_ls1b_index(rook_atks & bitboards[rook_piece]);
+    }
+
+    // Queens
+    int queen_piece = (attacker_side == white) ? Q : q;
+    U64 queen_atks = rook_atks | bishop_atks;
+    if (queen_atks & bitboards[queen_piece])
+    {
+        *attacker_piece = queen_piece;
+        return get_ls1b_index(queen_atks & bitboards[queen_piece]);
+    }
+
+    // King (only if no other options - capturing with king is risky)
+    int king_piece = (attacker_side == white) ? K : k;
+    if (king_attacks[square] & bitboards[king_piece])
+    {
+        *attacker_piece = king_piece;
+        return get_ls1b_index(king_attacks[square] & bitboards[king_piece]);
+    }
+
+    return -1; // No attacker found
+}
+
+// Static Exchange Evaluation
+// Returns estimated value of capture sequence
+int see(int move)
+{
+    int from = get_move_source(move);
+    int to = get_move_target(move);
+    int attacker = get_move_piece(move);
+
+    // Find captured piece
+    int captured = -1;
+    int start = (side == white) ? p : P;
+    int end = (side == white) ? k : K;
+
+    for (int piece = start; piece <= end; piece++)
+    {
+        if (get_bit(bitboards[piece], to))
+        {
+            captured = piece;
+            break;
+        }
+    }
+
+    // En passant capture
+    if (get_move_enpassant(move))
+    {
+        captured = (side == white) ? p : P;
+    }
+
+    if (captured == -1)
+        return 0; // Not a capture
+
+    int gain[32];
+    int depth = 0;
+
+    // Initial gain is captured piece value
+    gain[depth] = see_piece_values[captured % 6];
+
+    // Simulate the capture
+    int current_side = side ^ 1; // Opponent responds
+    int piece_on_square = attacker;
+
+    // Simple SEE approximation (full SEE is complex)
+    // Just check if the square is defended
+    int defender_piece;
+    int defender_sq = get_smallest_attacker(to, current_side, &defender_piece);
+
+    if (defender_sq == -1)
+    {
+        // Not defended - good capture!
+        return gain[0];
+    }
+
+    // Square is defended - check if exchange is good
+    // If we captured with piece worth more than victim - bad
+    if (see_piece_values[attacker % 6] > gain[0])
+    {
+        return gain[0] - see_piece_values[attacker % 6];
+    }
+
+    return gain[0];
+}
+
+// Check if SEE value of a move is >= threshold
+int see_ge(int move, int threshold)
+{
+    return see(move) >= threshold;
+}
+
 // Score moves to decide which to search first
+// Uses: PV > Good Captures > Killers > Counter-move > History
 int score_move(int move, int pv_move, int ply)
 {
     // 1. PV Move (Highest Priority)
     if (pv_move && move == pv_move)
         return 20000;
 
-    // 2. Captures (MVV-LVA)
+    // 2. Captures - use SEE to distinguish good/bad captures
     if (get_move_capture(move))
     {
         int target_square = get_move_target(move);
@@ -614,7 +815,13 @@ int score_move(int move, int pv_move, int ply)
                 break;
             }
         }
-        return mvv_lva[get_move_piece(move)][victim] + 10000;
+
+        // Good captures (SEE >= 0) get high score
+        int see_value = see(move);
+        if (see_value >= 0)
+            return mvv_lva[get_move_piece(move)][victim] + 10000;
+        else
+            return mvv_lva[get_move_piece(move)][victim] + see_value; // Bad captures scored lower
     }
 
     // 3. Killer Moves (1st Killer)
@@ -625,8 +832,27 @@ int score_move(int move, int pv_move, int ply)
     if (killer_moves[1][ply] == move)
         return 8000;
 
-    // 5. History Moves
-    return history_moves[get_move_piece(move)][get_move_target(move)];
+    // 5. Counter-move heuristic
+    // If last move was piece X to square Y, counter_moves[X][Y] is a good response
+    if (ply > 0)
+    {
+        int last_move = pv_table[ply - 1][ply - 1];
+        if (last_move)
+        {
+            int last_piece = get_move_piece(last_move);
+            int last_target = get_move_target(last_move);
+            if (counter_moves[last_piece][last_target] == move)
+                return 7000;
+        }
+    }
+
+    // 6. History Moves + Butterfly history bonus
+    int from_sq = get_move_source(move);
+    int to_sq = get_move_target(move);
+    int history_score = history_moves[get_move_piece(move)][to_sq];
+    history_score += butterfly_history[side][from_sq][to_sq] / 8;
+
+    return history_score;
 }
 
 // -------------------------------------------- \\
@@ -647,13 +873,32 @@ long long stop_time;
 long long time_for_move;
 int times_up = 0;
 
-// Check if time is up
+// ============================================ \\
+//              PONDERING SUPPORT               \\
+//  Think on opponent's time for free ELO!      \\
+// ============================================ \\
+
+volatile int pondering = 0;      // Is engine currently pondering?
+volatile int stop_pondering = 0; // Signal to stop pondering
+int ponder_move = 0;             // The move we're pondering on
+int ponder_hit = 0;              // Did opponent play our expected move?
+pthread_t ponder_thread;
+pthread_mutex_t search_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Check if time is up OR if we should stop pondering
 void communicate()
 {
     if (times_up)
         return;
 
-    // Fix: If time is infinite (-1), do not abort!
+    // Check for stop signal during pondering
+    if (pondering && stop_pondering)
+    {
+        times_up = 1;
+        return;
+    }
+
+    // Fix: If time is infinite (-1) or pondering, do not abort!
     if (time_for_move == -1)
         return;
 
@@ -2566,6 +2811,43 @@ const int trade_bonus_per_100cp = 5;
 // Blockade bonus - reward blocking passed pawns
 const int blockade_bonus = 20;
 
+// Mop-up evaluation constants (for winning endgames)
+// Push enemy king to corner when we have winning material
+const int center_manhattan_distance[64] = {
+    6, 5, 4, 3, 3, 4, 5, 6,
+    5, 4, 3, 2, 2, 3, 4, 5,
+    4, 3, 2, 1, 1, 2, 3, 4,
+    3, 2, 1, 0, 0, 1, 2, 3,
+    3, 2, 1, 0, 0, 1, 2, 3,
+    4, 3, 2, 1, 1, 2, 3, 4,
+    5, 4, 3, 2, 2, 3, 4, 5,
+    6, 5, 4, 3, 3, 4, 5, 6};
+
+// Distance between two squares (Chebyshev distance) - needed for mop_up_eval
+static inline int mop_up_square_distance(int sq1, int sq2)
+{
+    int r1 = sq1 / 8, f1 = sq1 % 8;
+    int r2 = sq2 / 8, f2 = sq2 % 8;
+    int dr = abs(r1 - r2);
+    int df = abs(f1 - f2);
+    return (dr > df) ? dr : df;
+}
+
+// Mop-up: Drive enemy king to corner when winning
+int mop_up_eval(int winning_side, int losing_king_sq, int winning_king_sq)
+{
+    int score = 0;
+
+    // 1. Push enemy king to corner (away from center)
+    score += center_manhattan_distance[losing_king_sq] * 10;
+
+    // 2. Bring our king closer to enemy king
+    int king_distance = mop_up_square_distance(winning_king_sq, losing_king_sq);
+    score += (14 - king_distance) * 4;
+
+    return score;
+}
+
 // File/Rank control
 const int seventh_rank_rook_bonus = 30;
 const int connected_rooks_bonus = 15;
@@ -3052,9 +3334,14 @@ int evaluate()
             {
             case P:
                 score += pawn_score[square];
-                // Passed pawn bonus (Tal loves pushing pawns!)
+                // Passed pawn bonus - use endgame bonus when fewer pieces
                 if (is_passed_pawn(square, white))
-                    score += passed_pawn_bonus[square / 8];
+                {
+                    if (phase_score <= 128)
+                        score += passed_pawn_bonus_eg[square / 8];
+                    else
+                        score += passed_pawn_bonus[square / 8];
+                }
                 break;
             case N:
                 score += knight_score[square];
@@ -3095,10 +3382,13 @@ int evaluate()
                 score += count_bits(get_queen_attacks(square, occupancies[both]) & ~occupancies[white]) * 1;
                 break;
             case K:
-                score += king_score[square];
-                // Pawn shelter bonus in middlegame
-                if (phase_score > 128)
+                // Use endgame king table when few pieces remain
+                if (phase_score <= 128)
+                    score += king_endgame_score[square];
+                else
                 {
+                    score += king_score[square];
+                    // Pawn shelter bonus in middlegame
                     U64 shelter_mask = king_attacks[square] & bitboards[P];
                     score += count_bits(shelter_mask) * pawn_shelter_bonus;
                 }
@@ -3107,8 +3397,14 @@ int evaluate()
             // Mirror indices for black pieces (subtracting because black is negative)
             case p:
                 score -= pawn_score[square ^ 56];
+                // Use stronger endgame passed pawn bonus
                 if (is_passed_pawn(square, black))
-                    score -= passed_pawn_bonus[7 - (square / 8)];
+                {
+                    if (phase_score <= 128)
+                        score -= passed_pawn_bonus_eg[7 - (square / 8)];
+                    else
+                        score -= passed_pawn_bonus[7 - (square / 8)];
+                }
                 break;
             case n:
                 score -= knight_score[square ^ 56];
@@ -3142,15 +3438,37 @@ int evaluate()
                 score -= count_bits(get_queen_attacks(square, occupancies[both]) & ~occupancies[black]) * 1;
                 break;
             case k:
-                score -= king_score[square ^ 56];
-                if (phase_score > 128)
+                // Use endgame king table when few pieces remain
+                if (phase_score <= 128)
+                    score -= king_endgame_score[square ^ 56];
+                else
                 {
+                    score -= king_score[square ^ 56];
                     U64 shelter_mask = king_attacks[square] & bitboards[p];
                     score -= count_bits(shelter_mask) * pawn_shelter_bonus;
                 }
                 break;
             }
             pop_bit(bitboard, square);
+        }
+    }
+
+    // ============================================
+    // MOP-UP EVALUATION - For winning endgames
+    // Push enemy king to corner when we have big material advantage
+    // ============================================
+    if (phase_score <= 128 && abs(material_imbalance) >= 400)
+    {
+        // We are in endgame with significant material advantage
+        if (material_imbalance > 0)
+        {
+            // White is winning - push black king to corner
+            score += mop_up_eval(white, black_king_sq, white_king_sq);
+        }
+        else
+        {
+            // Black is winning - push white king to corner
+            score -= mop_up_eval(black, white_king_sq, black_king_sq);
         }
     }
 
@@ -3223,8 +3541,9 @@ int quiescence(int alpha, int beta)
         if (!get_move_capture(move_list->moves[count]))
             continue;
 
-        // SEE pruning - skip bad captures (losing material)
-        // Simple version: skip if capturing with higher value piece on protected square
+        // SEE pruning in quiescence - skip bad captures
+        if (!see_ge(move_list->moves[count], 0))
+            continue;
 
         copy_board();
         if (!make_move(move_list->moves[count], only_captures))
@@ -3244,11 +3563,17 @@ int quiescence(int alpha, int beta)
     return alpha;
 }
 
-// Negamax with Alpha-Beta, Killer Moves, and History Heuristic
+// Track the last move made for counter-move heuristic
+int last_move_made[MAX_PLY];
+
+// Negamax with Alpha-Beta, Killer Moves, History, and Counter-moves
 int negamax(int alpha, int beta, int depth, int ply)
 {
     // Initialize PV length
     pv_length[ply] = ply;
+
+    // Is this a PV node (principal variation)?
+    int pv_node = (beta - alpha > 1);
 
     // 1. Time Check (Every 2048 nodes to save performance)
     if ((nodes & 2047) == 0)
@@ -3401,8 +3726,45 @@ int negamax(int alpha, int beta, int depth, int ply)
         repetition_index++;
         repetition_table[repetition_index] = hash_key;
 
+        // Track last move for counter-move heuristic
+        last_move_made[ply] = move_list->moves[count];
+
         moves_searched++;
         int score;
+
+        int is_capture = get_move_capture(move_list->moves[count]);
+        int is_promotion = get_move_promoted(move_list->moves[count]);
+        int is_quiet = !is_capture && !is_promotion;
+
+        // --- LATE MOVE PRUNING (LMP) ---
+        // Skip late quiet moves at low depths if position looks bad
+        if (depth <= 3 && !pv_node && !in_check && is_quiet && moves_searched > lmp_margins[depth])
+        {
+            repetition_index = old_rep_index;
+            take_back();
+            continue;
+        }
+
+        // --- FUTILITY PRUNING at move level ---
+        // Skip quiet moves that can't possibly raise alpha
+        if (depth <= 6 && !pv_node && !in_check && is_quiet && moves_searched > 1)
+        {
+            int static_eval = evaluate();
+            if (static_eval + futility_margins[depth] <= alpha)
+            {
+                repetition_index = old_rep_index;
+                take_back();
+                continue;
+            }
+        }
+
+        // --- SEE PRUNING for bad captures ---
+        if (depth <= 6 && !pv_node && is_capture && !see_ge(move_list->moves[count], -20 * depth))
+        {
+            repetition_index = old_rep_index;
+            take_back();
+            continue;
+        }
 
         // PVS + LMR
         if (moves_searched == 1)
@@ -3415,9 +3777,7 @@ int negamax(int alpha, int beta, int depth, int ply)
             // Late Move Reductions
             int reduction = 0;
 
-            if (moves_searched >= 4 && depth >= 3 && !in_check &&
-                !get_move_capture(move_list->moves[count]) &&
-                !get_move_promoted(move_list->moves[count]))
+            if (moves_searched >= 4 && depth >= 3 && !in_check && is_quiet)
             {
                 // Use LMR table
                 reduction = lmr_table[depth < MAX_PLY ? depth : MAX_PLY - 1][moves_searched < 64 ? moves_searched : 63];
@@ -3426,6 +3786,18 @@ int negamax(int alpha, int beta, int depth, int ply)
                 if (move_list->moves[count] == killer_moves[0][ply] ||
                     move_list->moves[count] == killer_moves[1][ply])
                     reduction--;
+
+                // Reduce less for counter-moves
+                if (ply > 0 && last_move_made[ply - 1])
+                {
+                    int lm = last_move_made[ply - 1];
+                    if (counter_moves[get_move_piece(lm)][get_move_target(lm)] == move_list->moves[count])
+                        reduction--;
+                }
+
+                // Reduce more for moves with bad history
+                if (history_moves[get_move_piece(move_list->moves[count])][get_move_target(move_list->moves[count])] < 0)
+                    reduction++;
 
                 // Don't reduce below 1
                 if (reduction > depth - 2)
@@ -3467,12 +3839,28 @@ int negamax(int alpha, int beta, int depth, int ply)
 
         if (score >= beta)
         {
-            // Update killer and history for quiet moves
-            if (!get_move_capture(move_list->moves[count]))
+            // Update killer, history, and counter-moves for quiet moves that cause cutoff
+            if (is_quiet)
             {
+                // Killer moves
                 killer_moves[1][ply] = killer_moves[0][ply];
                 killer_moves[0][ply] = move_list->moves[count];
-                history_moves[get_move_piece(move_list->moves[count])][get_move_target(move_list->moves[count])] += depth * depth;
+
+                // History bonus
+                int bonus = depth * depth;
+                history_moves[get_move_piece(move_list->moves[count])][get_move_target(move_list->moves[count])] += bonus;
+
+                // Butterfly history
+                int from = get_move_source(move_list->moves[count]);
+                int to = get_move_target(move_list->moves[count]);
+                butterfly_history[side][from][to] += bonus;
+
+                // Counter-move
+                if (ply > 0 && last_move_made[ply - 1])
+                {
+                    int lm = last_move_made[ply - 1];
+                    counter_moves[get_move_piece(lm)][get_move_target(lm)] = move_list->moves[count];
+                }
             }
             write_tt(depth, beta, HASH_BETA, move_list->moves[count], ply);
             return beta;
@@ -3492,7 +3880,7 @@ int negamax(int alpha, int beta, int depth, int ply)
         if (in_check)
             return -MATE + ply;
         else
-            return 0; // Stalemate
+            return contempt; // Stalemate - use contempt factor
     }
 
     // Store in TT
@@ -3588,8 +3976,39 @@ void uci_loop()
         if (input[0] == '\n')
             continue;
 
+        // Handle "stop" command - stop pondering or search
+        if (strncmp(input, "stop", 4) == 0)
+        {
+            if (pondering)
+            {
+                stop_pondering = 1;
+                pthread_join(ponder_thread, NULL);
+                pondering = 0;
+            }
+            times_up = 1;
+            continue;
+        }
+
+        // Handle "ponderhit" - opponent played our expected move!
+        if (strncmp(input, "ponderhit", 9) == 0)
+        {
+            if (pondering)
+            {
+                ponder_hit = 1;
+                pondering = 0; // Switch to normal search with time management
+            }
+            continue;
+        }
+
         if (strncmp(input, "isready", 7) == 0)
         {
+            // Wait for any pondering to complete
+            if (pondering)
+            {
+                stop_pondering = 1;
+                pthread_join(ponder_thread, NULL);
+                pondering = 0;
+            }
             printf("readyok\n");
             continue;
         }
@@ -3633,6 +4052,42 @@ void uci_loop()
                     load_nnue(filename);
                 }
             }
+            else if (strstr(input, "Hash"))
+            {
+                char *value = strstr(input, "value");
+                if (value)
+                {
+                    hash_size_mb = atoi(value + 6);
+                    if (hash_size_mb < 1)
+                        hash_size_mb = 1;
+                    if (hash_size_mb > 4096)
+                        hash_size_mb = 4096;
+                    printf("info string Hash set to %d MB\n", hash_size_mb);
+                    // Note: In a full implementation, you'd resize the TT here
+                }
+            }
+            else if (strstr(input, "Contempt"))
+            {
+                char *value = strstr(input, "value");
+                if (value)
+                {
+                    contempt = atoi(value + 6);
+                    printf("info string Contempt set to %d cp\n", contempt);
+                }
+            }
+            else if (strstr(input, "MultiPV"))
+            {
+                char *value = strstr(input, "value");
+                if (value)
+                {
+                    multi_pv = atoi(value + 6);
+                    if (multi_pv < 1)
+                        multi_pv = 1;
+                    if (multi_pv > 10)
+                        multi_pv = 10;
+                    printf("info string MultiPV set to %d\n", multi_pv);
+                }
+            }
             continue;
         }
         else if (strncmp(input, "position", 8) == 0)
@@ -3649,13 +4104,26 @@ void uci_loop()
             clear_tt();
             memset(killer_moves, 0, sizeof(killer_moves));
             memset(history_moves, 0, sizeof(history_moves));
+            memset(counter_moves, 0, sizeof(counter_moves));
+            memset(butterfly_history, 0, sizeof(butterfly_history));
             repetition_index = 0;
         }
 
         else if (strncmp(input, "go", 2) == 0)
         {
-            // Check opening book first
-            if (use_book)
+            // Stop any existing pondering
+            if (pondering)
+            {
+                stop_pondering = 1;
+                pthread_join(ponder_thread, NULL);
+                pondering = 0;
+            }
+
+            // Check if this is a ponder command
+            int is_ponder = (strstr(input, "ponder") != NULL);
+
+            // Check opening book first (but not when pondering)
+            if (use_book && !is_ponder)
             {
                 int book_move = get_book_move();
                 if (book_move)
@@ -3680,8 +4148,8 @@ void uci_loop()
             if ((ptr = strstr(input, "depth")))
                 depth = atoi(ptr + 6);
 
-            // 3. Parse infinite
-            int infinite = (strstr(input, "infinite") != NULL);
+            // 3. Parse infinite or ponder
+            int infinite = (strstr(input, "infinite") != NULL) || is_ponder;
 
             // 4. Parse Time (wtime/btime)
             if ((ptr = strstr(input, "movestogo")))
@@ -3834,27 +4302,46 @@ void uci_loop()
                     break;
             }
 
-            // 8. Output Final Best Move
+            // 8. Output Final Best Move with ponder move if available
             printf("bestmove ");
             if (best_move)
                 print_move(best_move);
             else
                 printf("0000"); // Fallback if no move found
+
+            // Output ponder move (second move in PV) if we have one
+            if (pv_length[0] >= 2 && pv_table[0][1])
+            {
+                printf(" ponder ");
+                print_move(pv_table[0][1]);
+                ponder_move = pv_table[0][1];
+            }
             printf("\n");
         }
 
         else if (strncmp(input, "quit", 4) == 0)
         {
+            // Stop any pondering before quitting
+            if (pondering)
+            {
+                stop_pondering = 1;
+                pthread_join(ponder_thread, NULL);
+            }
             break;
         }
         else if (strncmp(input, "uci", 3) == 0)
         {
-            printf("id name Fe64-Boa\n");
+            printf("id name Fe64-Boa v3.0\n");
             printf("id author Syed Masood\n");
+            printf("option name Hash type spin default 64 min 1 max 4096\n");
+            printf("option name Contempt type spin default 10 min -100 max 100\n");
+            printf("option name MultiPV type spin default 1 min 1 max 10\n");
             printf("option name OwnBook type check default true\n");
             printf("option name BookFile type string default book.bin\n");
             printf("option name UseNNUE type check default false\n");
             printf("option name NNUEFile type string default nnue.bin\n");
+            printf("option name Ponder type check default true\n");
+            printf("option name SyzygyPath type string default <empty>\n");
             printf("uciok\n");
         }
         // Custom commands for training/debugging
@@ -3909,6 +4396,9 @@ int main(int argc, char *argv[])
     memset(history_moves, 0, sizeof(history_moves));
     memset(pv_table, 0, sizeof(pv_table));
     memset(pv_length, 0, sizeof(pv_length));
+    memset(counter_moves, 0, sizeof(counter_moves));
+    memset(butterfly_history, 0, sizeof(butterfly_history));
+    memset(last_move_made, 0, sizeof(last_move_made));
 
     repetition_index = 0;
 

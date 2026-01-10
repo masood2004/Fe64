@@ -5,11 +5,13 @@ engine:
   dir: "/home/syedmasoodhussain/Desktop/chess_engine/bin/"
   name: "bbc"
   protocol: "uci"
+  ponder: true # Enable pondering - think on opponent's time!
 
   # ONLY use options your engine actually supports!
   # Hash and Threads are removed because your code doesn't declare them yet.
   uci_options:
     OwnBook: true
+    Ponder: true
 
 matchmaking:
   allow_matchmaking: true
