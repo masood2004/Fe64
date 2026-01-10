@@ -12,6 +12,9 @@ engine:
   uci_options:
     OwnBook: true
     Ponder: true
+    UseNNUE: false # Disabled - use HCE until NNUE is properly trained
+    Hash: 256
+    Contempt: 20
 
 matchmaking:
   allow_matchmaking: true

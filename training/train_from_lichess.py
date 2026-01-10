@@ -72,13 +72,24 @@ class NNUETrainer:
     def save_weights(self, filename):
         """Save NNUE weights in format compatible with bbc.c"""
         with open(filename, 'wb') as f:
-            f.write(self.input_weights.tobytes())
-            f.write(self.hidden1_bias.tobytes())
-            f.write(self.hidden1_weights.tobytes())
-            f.write(self.hidden2_bias.tobytes())
-            f.write(self.hidden2_weights.tobytes())
+            # Ensure all arrays are float32 before saving
+            f.write(self.input_weights.astype(np.float32).tobytes())
+            f.write(self.hidden1_bias.astype(np.float32).tobytes())
+            f.write(self.hidden1_weights.astype(np.float32).tobytes())
+            f.write(self.hidden2_bias.astype(np.float32).tobytes())
+            f.write(self.hidden2_weights.astype(np.float32).tobytes())
             f.write(np.array([self.output_bias], dtype=np.float32).tobytes())
-        print(f"Saved NNUE weights to {filename}")
+
+        # Verify file size
+        expected_size = (NNUE_INPUT_SIZE * NNUE_HIDDEN1_SIZE + NNUE_HIDDEN1_SIZE +
+                         NNUE_HIDDEN1_SIZE * NNUE_HIDDEN2_SIZE + NNUE_HIDDEN2_SIZE +
+                         NNUE_HIDDEN2_SIZE + 1) * 4
+        actual_size = os.path.getsize(filename)
+        if actual_size != expected_size:
+            print(
+                f"WARNING: File size mismatch! Expected {expected_size}, got {actual_size}")
+        else:
+            print(f"Saved NNUE weights to {filename} ({actual_size} bytes)")
 
     @staticmethod
     def crelu(x):
@@ -165,13 +176,19 @@ class NNUETrainer:
             grad_hidden1_bias += d_hidden1
             grad_input_weights += np.outer(input_vec, d_hidden1)
 
-        # Update weights
-        self.input_weights -= learning_rate * grad_input_weights
-        self.hidden1_bias -= learning_rate * grad_hidden1_bias
-        self.hidden1_weights -= learning_rate * grad_hidden1_weights
-        self.hidden2_bias -= learning_rate * grad_hidden2_bias
-        self.hidden2_weights -= learning_rate * grad_hidden2_weights
-        self.output_bias -= learning_rate * grad_output_bias
+        # Update weights (ensure float32 after operations)
+        self.input_weights = (
+            self.input_weights - learning_rate * grad_input_weights).astype(np.float32)
+        self.hidden1_bias = (self.hidden1_bias - learning_rate *
+                             grad_hidden1_bias).astype(np.float32)
+        self.hidden1_weights = (
+            self.hidden1_weights - learning_rate * grad_hidden1_weights).astype(np.float32)
+        self.hidden2_bias = (self.hidden2_bias - learning_rate *
+                             grad_hidden2_bias).astype(np.float32)
+        self.hidden2_weights = (
+            self.hidden2_weights - learning_rate * grad_hidden2_weights).astype(np.float32)
+        self.output_bias = np.float32(
+            self.output_bias - learning_rate * grad_output_bias)
 
         return total_loss / batch_size
 

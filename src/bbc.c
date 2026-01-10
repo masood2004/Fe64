@@ -265,6 +265,7 @@ const int futility_margins[7] = {0, 100, 200, 300, 400, 500, 600};
 // UCI configurable options
 int hash_size_mb = 64; // Default 64 MB hash table
 int multi_pv = 1;      // Number of principal variations to search
+int use_nnue_eval = 0; // Runtime flag to enable/disable NNUE (separate from compile-time)
 
 // Initialize LMR table
 void init_lmr_table()
@@ -3121,13 +3122,15 @@ int calculate_king_tropism(int color)
 }
 
 // NNUE Evaluation (if enabled and loaded)
+// OPTIMIZED: Only iterate over active pieces (~32 max), not all 768 inputs!
 int evaluate_nnue()
 {
     if (!nnue_weights.loaded)
         return 0;
 
-    // Build input vector
-    float input[NNUE_INPUT_SIZE] = {0};
+    // Collect active piece indices (much faster than iterating 768 inputs)
+    int active_indices[32];
+    int num_active = 0;
 
     for (int piece = P; piece <= k; piece++)
     {
@@ -3136,24 +3139,30 @@ int evaluate_nnue()
         {
             int sq = get_ls1b_index(bb);
             int idx = piece * 64 + sq;
-            if (idx < NNUE_INPUT_SIZE)
-                input[idx] = 1.0f;
+            if (idx < NNUE_INPUT_SIZE && num_active < 32)
+                active_indices[num_active++] = idx;
             pop_bit(bb, sq);
         }
     }
 
-    // Forward pass - Layer 1
+    // Forward pass - Layer 1 (OPTIMIZED: only add active weights)
     float hidden1[NNUE_HIDDEN1_SIZE];
+
+    // Start with biases
     for (int i = 0; i < NNUE_HIDDEN1_SIZE; i++)
-    {
         hidden1[i] = nnue_weights.hidden1_bias[i];
-        for (int j = 0; j < NNUE_INPUT_SIZE; j++)
-        {
-            if (input[j] > 0.5f)
-                hidden1[i] += nnue_weights.input_weights[j][i];
-        }
-        hidden1[i] = crelu(hidden1[i]);
+
+    // Only add weights for active pieces (32 pieces max vs 768!)
+    for (int a = 0; a < num_active; a++)
+    {
+        int j = active_indices[a];
+        for (int i = 0; i < NNUE_HIDDEN1_SIZE; i++)
+            hidden1[i] += nnue_weights.input_weights[j][i];
     }
+
+    // Apply activation
+    for (int i = 0; i < NNUE_HIDDEN1_SIZE; i++)
+        hidden1[i] = crelu(hidden1[i]);
 
     // Forward pass - Layer 2
     float hidden2[NNUE_HIDDEN2_SIZE];
@@ -3242,8 +3251,8 @@ int is_passed_pawn(int square, int color)
 
 int evaluate()
 {
-    // Try NNUE evaluation first (if loaded)
-    if (NNUE_ENABLED && nnue_weights.loaded)
+    // Try NNUE evaluation first (if enabled at runtime AND loaded)
+    if (use_nnue_eval && nnue_weights.loaded)
     {
         return evaluate_nnue();
     }
@@ -4035,10 +4044,27 @@ void uci_loop()
             else if (strstr(input, "UseNNUE"))
             {
                 int use_nnue = (strstr(input, "true") != NULL);
+                use_nnue_eval = use_nnue; // Set the runtime flag
                 if (use_nnue && !nnue_weights.loaded)
                 {
                     printf("info string NNUE not loaded, trying nnue.bin\n");
-                    load_nnue("nnue.bin");
+                    if (load_nnue("nnue.bin"))
+                    {
+                        printf("info string NNUE enabled\n");
+                    }
+                    else
+                    {
+                        printf("info string NNUE file not found, using HCE\n");
+                        use_nnue_eval = 0;
+                    }
+                }
+                else if (use_nnue)
+                {
+                    printf("info string NNUE enabled\n");
+                }
+                else
+                {
+                    printf("info string NNUE disabled, using HCE\n");
                 }
             }
             else if (strstr(input, "NNUEFile"))
@@ -4049,7 +4075,11 @@ void uci_loop()
                     value += 6;
                     char filename[256];
                     sscanf(value, "%255s", filename);
-                    load_nnue(filename);
+                    if (load_nnue(filename))
+                    {
+                        use_nnue_eval = 1; // Auto-enable when file loaded successfully
+                        printf("info string NNUE file loaded and enabled\n");
+                    }
                 }
             }
             else if (strstr(input, "Hash"))
