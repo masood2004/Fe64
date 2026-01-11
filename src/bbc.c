@@ -10,6 +10,15 @@
 #include <math.h>
 #include <pthread.h>
 
+// Platform-specific includes for non-blocking input
+#ifdef _WIN32
+#include <windows.h>
+#include <conio.h>
+#else
+#include <unistd.h>
+#include <sys/select.h>
+#endif
+
 // ============================================ \\
 //         NEURAL NETWORK (NNUE) CONFIG         \\
 // ============================================ \\
@@ -256,11 +265,26 @@ const int see_piece_values[12] = {
 // Contempt factor - avoid draws when stronger
 int contempt = 10; // centipawns
 
-// Late Move Pruning margins
-const int lmp_margins[4] = {0, 8, 12, 24};
+// Late Move Pruning margins (more aggressive)
+const int lmp_margins[8] = {0, 5, 8, 12, 18, 25, 33, 42};
 
 // Futility pruning margins by depth
-const int futility_margins[7] = {0, 100, 200, 300, 400, 500, 600};
+const int futility_margins[7] = {0, 100, 160, 220, 280, 340, 400};
+
+// Razoring margins (prune hopeless positions)
+const int razor_margins[4] = {0, 125, 250, 375};
+
+// Reverse futility pruning margins (static null move pruning)
+const int rfp_margins[7] = {0, 70, 140, 210, 280, 350, 420};
+
+// Singular extension margin
+const int singular_margin = 64;
+
+// History gravity - for aging history scores
+const int history_max = 16384;
+
+// Capture history [piece][to][captured_piece]
+int capture_history[12][64][6];
 
 // UCI configurable options
 int hash_size_mb = 64; // Default 64 MB hash table
@@ -792,66 +816,88 @@ int see_ge(int move, int threshold)
     return see(move) >= threshold;
 }
 
+// Track the last move made for counter-move heuristic (declared early for score_move)
+int last_move_made[MAX_PLY];
+
 // Score moves to decide which to search first
 // Uses: PV > Good Captures > Killers > Counter-move > History
 int score_move(int move, int pv_move, int ply)
 {
     // 1. PV Move (Highest Priority)
     if (pv_move && move == pv_move)
-        return 20000;
+        return 30000;
 
-    // 2. Captures - use SEE to distinguish good/bad captures
+    int piece = get_move_piece(move);
+    int target = get_move_target(move);
+    int from = get_move_source(move);
+
+    // 2. Promotions - very high priority, especially queen promotions
+    int promoted = get_move_promoted(move);
+    if (promoted)
+    {
+        // Queen promotion is best
+        if (promoted == Q || promoted == q)
+            return 28000;
+        return 25000 + promoted;
+    }
+
+    // 3. Captures - use SEE and MVV-LVA
     if (get_move_capture(move))
     {
-        int target_square = get_move_target(move);
         int victim = P;
 
         int start = (side == white) ? p : P;
         int end = (side == white) ? k : K;
         for (int p = start; p <= end; p++)
         {
-            if (get_bit(bitboards[p], target_square))
+            if (get_bit(bitboards[p], target))
             {
                 victim = p;
                 break;
             }
         }
 
-        // Good captures (SEE >= 0) get high score
+        // Use SEE to determine capture quality
         int see_value = see(move);
         if (see_value >= 0)
-            return mvv_lva[get_move_piece(move)][victim] + 10000;
-        else
-            return mvv_lva[get_move_piece(move)][victim] + see_value; // Bad captures scored lower
-    }
-
-    // 3. Killer Moves (1st Killer)
-    if (killer_moves[0][ply] == move)
-        return 9000;
-
-    // 4. Killer Moves (2nd Killer)
-    if (killer_moves[1][ply] == move)
-        return 8000;
-
-    // 5. Counter-move heuristic
-    // If last move was piece X to square Y, counter_moves[X][Y] is a good response
-    if (ply > 0)
-    {
-        int last_move = pv_table[ply - 1][ply - 1];
-        if (last_move)
         {
-            int last_piece = get_move_piece(last_move);
-            int last_target = get_move_target(last_move);
-            if (counter_moves[last_piece][last_target] == move)
-                return 7000;
+            // Good captures: 10000 + MVV-LVA + capture history bonus
+            int cap_hist = capture_history[piece][target][victim % 6] / 64;
+            return 15000 + mvv_lva[piece][victim] + cap_hist;
+        }
+        else
+        {
+            // Bad captures: ordered by SEE value (negative), placed after quiet moves
+            return see_value;
         }
     }
 
-    // 6. History Moves + Butterfly history bonus
-    int from_sq = get_move_source(move);
-    int to_sq = get_move_target(move);
-    int history_score = history_moves[get_move_piece(move)][to_sq];
-    history_score += butterfly_history[side][from_sq][to_sq] / 8;
+    // 4. Killer Moves (1st Killer)
+    if (killer_moves[0][ply] == move)
+        return 9000;
+
+    // 5. Killer Moves (2nd Killer)
+    if (killer_moves[1][ply] == move)
+        return 8500;
+
+    // 6. Counter-move heuristic
+    if (ply > 0 && last_move_made[ply - 1])
+    {
+        int last_piece = get_move_piece(last_move_made[ply - 1]);
+        int last_target = get_move_target(last_move_made[ply - 1]);
+        if (counter_moves[last_piece][last_target] == move)
+            return 8000;
+    }
+
+    // 7. History Moves + Butterfly history bonus
+    int history_score = history_moves[piece][target];
+    history_score += butterfly_history[side][from][target] / 4;
+
+    // Clamp to prevent overflow issues
+    if (history_score > 7999)
+        history_score = 7999;
+    if (history_score < -7999)
+        history_score = -7999;
 
     return history_score;
 }
@@ -879,27 +925,71 @@ int times_up = 0;
 //  Think on opponent's time for free ELO!      \\
 // ============================================ \\
 
-volatile int pondering = 0;      // Is engine currently pondering?
-volatile int stop_pondering = 0; // Signal to stop pondering
-int ponder_move = 0;             // The move we're pondering on
-int ponder_hit = 0;              // Did opponent play our expected move?
-pthread_t ponder_thread;
+volatile int pondering = 0;          // Is engine currently pondering?
+volatile int stop_pondering = 0;     // Signal to stop pondering
+int ponder_move = 0;                 // The move we're pondering on
+int ponder_hit = 0;                  // Did opponent play our expected move?
+long long ponder_time_for_move = -1; // Time allocated when ponderhit occurs
 pthread_mutex_t search_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Check if time is up OR if we should stop pondering
+// Check if input is available on stdin (non-blocking)
+int input_waiting()
+{
+#ifdef _WIN32
+    // Windows: Check if input is available
+    static int init = 0;
+    static HANDLE h;
+    DWORD mode;
+    if (!init)
+    {
+        init = 1;
+        h = GetStdHandle(STD_INPUT_HANDLE);
+        GetConsoleMode(h, &mode);
+        SetConsoleMode(h, mode & ~(ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT));
+        FlushConsoleInputBuffer(h);
+    }
+    return _kbhit();
+#else
+    // Linux/Unix: Use select() for non-blocking check
+    fd_set readfds;
+    struct timeval tv;
+    FD_ZERO(&readfds);
+    FD_SET(STDIN_FILENO, &readfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    return select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv) > 0;
+#endif
+}
+
+// Flag to indicate if we should check stdin during search
+int check_stdin_during_search = 0;
+
+// Check if time is up OR if we should stop pondering OR if GUI sent stop
 void communicate()
 {
     if (times_up)
         return;
 
     // Check for stop signal during pondering
-    if (pondering && stop_pondering)
+    if (stop_pondering)
     {
         times_up = 1;
         return;
     }
 
-    // Fix: If time is infinite (-1) or pondering, do not abort!
+    // If pondering and got ponderhit, switch to timed search
+    if (pondering && ponder_hit && ponder_time_for_move != -1)
+    {
+        pondering = 0;
+        time_for_move = ponder_time_for_move;
+        start_time = get_time_ms(); // Reset start time for new time allocation
+    }
+
+    // If still pondering (infinite), don't time out
+    if (pondering)
+        return;
+
+    // Fix: If time is infinite (-1), do not abort based on time
     if (time_for_move == -1)
         return;
 
@@ -2038,49 +2128,216 @@ const U64 polyglot_random64[781] = {
     0x82C7709E781EB7CCULL, 0xF3218F1C9510786CULL, 0x331478F3AF51BBE6ULL, 0x4BB38DE5E7219443ULL,
     0xAA649C6EBCFD50FCULL, 0x8DBD98A352AFD40BULL, 0x87D2074B81D79217ULL, 0x19F3C751D3E92AE1ULL,
     0xB4AB30F062B19ABFULL, 0x7B0500AC42047AC4ULL, 0xC9452CA81A09D85DULL, 0x24AA6C514DA27500ULL,
-    0x8EC90D335519073FULL, 0xE42F42E66E5E0A0CULL, 0x8A9E38E1C74EFDB2ULL, 0x04FF625D04EB8EF6ULL,
-    0x0BC1F29FDA18CF51ULL, 0x0F628E38A11A09BBULL, 0x103D4B68C1CE6898ULL, 0x4EE93E64D2EB5A4AULL,
-    0x5B7BFF7E49249DDBULL, 0x043A8EFBEF65DA57ULL, 0x6B2FFF6EAED3A80AULL, 0x7E16E0E03E77E1AFULL,
-    0x04C03AB32EF0E3CEULL, 0x7D80E6C7B71C5C25ULL, 0x9C6DB5C6C9B2A0F9ULL, 0xAA9A5DD49E63B1D0ULL,
-    0xF0688D22C0FCCC09ULL, 0x568E4D2E6AF371EBULL, 0x8BDD55549B5D4F3EULL, 0xB4A25DC86FE1A6D3ULL,
-    0xADEC7EC67B7B6D6DULL, 0x0F47B3E48CEEE34CULL, 0xFB4B7DC8927E76EAULL, 0xBD53C68E9F62EBD7ULL,
-    0x87D29CA3A8ECCA06ULL, 0x4FE84D80D7C52A74ULL, 0x8DB7BF79F46D4E7DULL, 0xF2BEBD70D44C3C3EULL,
-    0x5D5FC98D4B62D6A7ULL, 0x0F4C4C644A3D4E3AULL, 0x7D4D1CBCA8CB66AFULL, 0x6B8D35E1F9A4EF0FULL,
-    0x42C8FC9A2D74E7CAULL, 0xCB3A4C5AEB5F8BD8ULL, 0x0A99F5EBAC3D9BA5ULL, 0x7B95B7E6CE5F8ECAULL,
-    // Row 17-32
-    0x5F2BCD8DB6C3EEB0ULL, 0x2E4C9B4FB8B0BFE5ULL, 0xE4A7EA3BD4C5EB8FULL, 0x2593D0E6AF9BF3A8ULL,
-    0x6E27E2B7AFD1C3B8ULL, 0xD5D4C8EDF1EEB7AEULL, 0x1D05C51D8B6A7E4BULL, 0x7E19E2CBB9A3CE6FULL,
-    0x4F5FAD9C1D7E8ADBULL, 0x1D28BFD0E6B8CBA7ULL, 0xB86A8DBFA3A2DA9FULL, 0x5A37BA8CDBDFDB7EULL,
-    0x7D6BED5CD8B4EDCFULL, 0x1C6F4E3BD2AFCD8BULL, 0xBD5E8DC7A9B3CDF7ULL, 0x2E48BD3CD7AE9DB5ULL,
-    0x9F7ACD5E8DBFCEB3ULL, 0x3F6BDE4CA8CDBE9FULL, 0xCE7F9D6B5ADFCED7ULL, 0x4E5ACE3B8DBEADC5ULL,
-    0xAF8BDE6C5CEFBDE3ULL, 0x5F6ADF4D9CDFCEB1ULL, 0xDF9FCE7B6AFEDFC9ULL, 0x6F7BEF5E0DEFDEF7ULL,
-    0xBFAFDF8D7BFFEFD5ULL, 0x7F8CFF6F1EFFFFE3ULL, 0xEFBFEF9E8CFFFFB1ULL, 0x8F9DFF7F2DFFFFCFULL,
-    0xFFCFFF0F9DFFFFDDULL, 0x9FAEFFFF3EFFFFEAULL, 0x0FDFFFF1AEFFFFEBULL, 0xAFBFFFF24FFFFFB7ULL,
-    // Rows 33-48 (entries 128-191)
-    0x1FCFFFF35FFFFFF3ULL, 0xBFDFFFF46FFFFFFULL, 0x2FDFFFF57FFFFFABULL, 0xCFEFFFF68FFFFF87ULL,
-    0x3FFFFFF79FFFFFB3ULL, 0xDFFFFFF8AFFFFF9FULL, 0x4FFFFFFBCFFFFFCBULL, 0xEFFFFFEDFFFFFD7ULL,
-    0x5FFFFFEFFFFFFFABULL, 0xFFFFFFFFFFFFFFFFULL, 0x6FFFFF1AFFFFFEBULL, 0x0FFFFF2BFFFFFCFULL,
-    0x7FFFFF3CFFFFFDFULL, 0x1FFFFF4DFFFFFEAULL, 0x8FFFFF5EFFFFFF7ULL, 0x2FFFFF6FFFFFFF3ULL,
-    // Filling remaining with semi-random values (real Polyglot uses 781 fixed values)
-    0x3FFFFF8AAAAAAAAULL, 0x4FFFFF9BBBBBBBBULL, 0x5FFFFFACCCCCCCULL, 0x6FFFFFBDDDDDDDULL,
-    0x7FFFFFCEEEEEEEULL, 0x8FFFFFFFFFFFFFFULL, 0x9FFFFF0000000000ULL, 0xAFFFFF1111111111ULL,
-    0xBFFFFF2222222222ULL, 0xCFFFFF3333333333ULL, 0xDFFFFF4444444444ULL, 0xEFFFFF5555555555ULL,
-    // Continue filling up to 781 entries...
-    0xFFFFF66666666666ULL, 0x0FFFF77777777777ULL, 0x1FFFF88888888888ULL, 0x2FFFF99999999999ULL,
-    0x3FFFFAAAAAAAAAAAULL, 0x4FFFFBBBBBBBBBBULL, 0x5FFFFCCCCCCCCCCULL, 0x6FFFFDDDDDDDDDDDULL,
-    0x7FFFFEEEEEEEEEEEULL, 0x8FFFFFFFFFFFFFFFULL, 0x9FFFF0123456789AULL, 0xAFFFFBCDEF012345ULL,
-    0xBFFFF6789ABCDEF0ULL, 0xCFFFF123456789ABULL, 0xDFFFFCDEF0123456ULL, 0xEFFFF789ABCDEF01ULL,
-    // More entries for the remaining slots (768-780)
-    0xFFFF234567890ABCULL, 0x0FFF8DEF01234567ULL, 0x1FFF9ABCDEF01234ULL, 0x2FFF567890ABCDEFULL,
-    0x3FFF0123456789ABULL, 0x4FFFCDEF01234567ULL, 0x5FFF89ABCDEF0123ULL, 0x6FFF4567890ABCDEULL,
-    0x7FFF0123456789ABULL, 0x8FFFCDEF01234567ULL, 0x9FFF89ABCDEF0123ULL, 0xAFFF4567890ABCDEULL,
-    0xBFFF0123456789ABULL // Entry 780
-};
+    0x4C9F34427501B447ULL, 0x14A68FD73C910841ULL, 0xA71B9B83461CBD93ULL, 0x03488B95B0F1850FULL,
+    0x637B2B34FF93C040ULL, 0x09D1BC9A3DD90A94ULL, 0x3575668334A1DD3BULL, 0x735E2B97A4C45A23ULL,
+    0x18727070F1BD400BULL, 0x1FCBACD259BF02E7ULL, 0xD310A7C2CE9B6555ULL, 0xBF983FE0FE5D8244ULL,
+    0x9F74D14F7454A824ULL, 0x51EBDC4AB9BA3035ULL, 0x5C82C505DB9AB0FAULL, 0xFCF7FE8A3430B241ULL,
+    0x3253A729B9BA3DDEULL, 0x8C74C368081B3075ULL, 0xB9BC6C87167C33E7ULL, 0x7EF48F2B83024E20ULL,
+    0x11D505D4C351BD7FULL, 0x6568FCA92C76A243ULL, 0x4DE0B0F40F32A7B8ULL, 0x96D693460CC37E5DULL,
+    0x42E240CB63689F2FULL, 0x6D2BDCDAE2919661ULL, 0x42880B0236E4D951ULL, 0x5F0F4A5898171BB6ULL,
+    0x39F890F579F92F88ULL, 0x93C5B5F47356388BULL, 0x63DC359D8D231B78ULL, 0xEC16CA8AEA98AD76ULL,
+    0x5355F900C2A82DC7ULL, 0x07FB9F855A997142ULL, 0x5093417AA8A7ED5EULL, 0x7BCBC38DA25A7F3CULL,
+    0x19FC8A768CF4B6D4ULL, 0x637A7780DECFC0D9ULL, 0x8249A47AEE0E41F7ULL, 0x79AD695501E7D1E8ULL,
+    0x14ACBAF4777D5776ULL, 0xF145B6BECCDEA195ULL, 0xDABF2AC8201752FCULL, 0x24C3C94DF9C8D3F6ULL,
+    0xBB6E2924F03912EAULL, 0x0CE26C0B95C980D9ULL, 0xA49CD132BFBF7CC4ULL, 0xE99D662AF4243939ULL,
+    0x27E6AD7891165C3FULL, 0x8535F040B9744FF1ULL, 0x54B3F4FA5F40D873ULL, 0x72B12C32127FED2BULL,
+    0xEE954D3C7B411F47ULL, 0x9A85AC909A24EAA1ULL, 0x70AC4CD9F04F21F5ULL, 0xF9B89D3E99A075C2ULL,
+    0x87B3E2B2B5C907B1ULL, 0xA366E5B8C54F48B8ULL, 0xAE4A9346CC3F7CF2ULL, 0x1920C04D47267BBDULL,
+    0x87BF02C6B49E2AE9ULL, 0x092237AC237F3859ULL, 0xFF07F64EF8ED14D0ULL, 0x8DE8DCA9F03CC54EULL,
+    0x9C1633264DB49C89ULL, 0xB3F22C3D0B0B38EDULL, 0x390E5FB44D01144BULL, 0x5BFEA5B4712768E9ULL,
+    0x1E1032911FA78984ULL, 0x9A74ACB964E78CB3ULL, 0x4F80F7A035DAFB04ULL, 0x6304D09A0B3738C4ULL,
+    0x2171E64683023A08ULL, 0x5B9B63EB9CEFF80CULL, 0x506AACF489889342ULL, 0x1881AFC9A3A701D6ULL,
+    0x6503080440750644ULL, 0xDFD395339CDBF4A7ULL, 0xEF927DBCF00C20F2ULL, 0x7B32F7D1E03680ECULL,
+    0xB9FD7620E7316243ULL, 0x05A7E8A57DB91B77ULL, 0xB5889C6E15630A75ULL, 0x4A750A09CE9573F7ULL,
+    0xCF464CEC899A2F8AULL, 0xF538639CE705B824ULL, 0x3C79A0FF5580EF7FULL, 0xEDE6C87F8477609DULL,
+    0x799E81F05BC93F31ULL, 0x86536B8CF3428A8CULL, 0x97D7374C60087B73ULL, 0xA246637CFF328532ULL,
+    0x043FCAE60CC0EBA0ULL, 0x920E449535DD359EULL, 0x70EB093B15B290CCULL, 0x73A1921916591CBDULL,
+    0x56436C9FE1A1AA8DULL, 0xEFAC4B70633B8F81ULL, 0xBB215798D45DF7AFULL, 0x45F20042F24F1768ULL,
+    0x930F80F4E8EB7462ULL, 0xFF6712FFCFD75EA1ULL, 0xAE623FD67468AA70ULL, 0xDD2C5BC84BC8D8FCULL,
+    0x7EED120D54CF2DD9ULL, 0x22FE545401165F1CULL, 0xC91800E98FB99929ULL, 0x808BD68E6AC10365ULL,
+    0xDEC468145B7605F6ULL, 0x1BEDE3A3AEF53302ULL, 0x43539603D6C55602ULL, 0xAA969B5C691CCB7AULL,
+    0xA87832D392EFEE56ULL, 0x65942C7B3C7E11AEULL, 0xDED2D633CAD004F6ULL, 0x21F08570F420E565ULL,
+    0xB415938D7DA94E3CULL, 0x91B859E59ECB6350ULL, 0x10CFF333E0ED804AULL, 0x28AED140BE0BB7DDULL,
+    0xC5CC1D89724FA456ULL, 0x5648F680F11A2741ULL, 0x2D255069F0B7DAB3ULL, 0x9BC5A38EF729ABD4ULL,
+    0xEF2F054308F6A2BCULL, 0xAF2042F5CC5C2858ULL, 0x480412BAB7F5BE2AULL, 0xAEF3AF4A563DFE43ULL,
+    0x19AFE59AE451497FULL, 0x52593803DFF1E840ULL, 0xF4F076E65F2CE6F0ULL, 0x11379625747D5AF3ULL,
+    0xBCE5D2248682C115ULL, 0x9DA4243DE836994FULL, 0x066F70B33FE09017ULL, 0x4DC4DE189B671A1CULL,
+    0x51039AB7712457C3ULL, 0xC07A3F80C31FB4B4ULL, 0xB46EE9C5E64A6E7CULL, 0xB3819A42ABE61C87ULL,
+    0x21A007933A522A20ULL, 0x2DF16F761598AA4FULL, 0x763C4A1371B368FDULL, 0xF793C46702E086A0ULL,
+    0xD7288E012AEB8D31ULL, 0xDE336A2A4BC1C44BULL, 0x0BF692B38D079F23ULL, 0x2C604A7A177326B3ULL,
+    0x4850E73E03EB6064ULL, 0xCFC447F1E53C8E1BULL, 0xB05CA3F564268D99ULL, 0x9AE182C8BC9474E8ULL,
+    0xA4FC4BD4FC5558CAULL, 0xE755178D58FC4E76ULL, 0x69B97DB1A4C03DFEULL, 0xF9B5B7C4ACC67C96ULL,
+    0xFC6A82D64B8655FBULL, 0x9C684CB6C4D24417ULL, 0x8EC97D2917456ED0ULL, 0x6703DF9D2924E97EULL,
+    0xC547F57E42A7444EULL, 0x78E37644E7CAD29EULL, 0xFE9A44E9362F05FAULL, 0x08BD35CC38336615ULL,
+    0x9315E5EB3A129ACEULL, 0x94061B871E04DF75ULL, 0xDF1D9F9D784BA010ULL, 0x3BBA57B68871B59DULL,
+    0xD2B7ADEEDED1F73FULL, 0xF7A255D83BC373F8ULL, 0xD7F4F2448C0CEB81ULL, 0xD95BE88CD210FFA7ULL,
+    0x336F52F8FF4728E7ULL, 0xA74049DAC312AC71ULL, 0xA2F61BB6E437FDB5ULL, 0x4F2A5CB07F6A35B3ULL,
+    0x87D380BDA5BF7859ULL, 0x16B9F7E06C453A21ULL, 0x7BA2484C8A0FD54EULL, 0xF3A678CAD9A2E38CULL,
+    0x39B0BF7DDE437BA2ULL, 0xFCAF55C1BF8A4424ULL, 0x18FCF680573FA594ULL, 0x4C0563B89F495AC3ULL,
+    0x40E087931A00930DULL, 0x8CFFA9412EB642C1ULL, 0x68CA39053261169FULL, 0x7A1EE967D27579E2ULL,
+    0x9D1D60E5076F5B6FULL, 0x3810E399B6F65BA2ULL, 0x32095B6D4AB5F9B1ULL, 0x35CAB62109DD038AULL,
+    0xA90B24499FCFAFB1ULL, 0x77A225A07CC2C6BDULL, 0x513E5E634C70E331ULL, 0x4361C0CA3F692F12ULL,
+    0xD941ACA44B20A45BULL, 0x528F7C8602C5807BULL, 0x52AB92BEB9613989ULL, 0x9D1DFA2EFC557F73ULL,
+    0x722FF175F572C348ULL, 0x1D1260A51107FE97ULL, 0x7A249A57EC0C9BA2ULL, 0x04208FE9E8F7F2D6ULL,
+    0x5A110C6058B920A0ULL, 0x0CD9A497658A5698ULL, 0x56FD23C8F9715A4CULL, 0x284C847B9D887AAEULL,
+    0x04FEABFBBDB619CBULL, 0x742E1E651C60BA83ULL, 0x9A9632E65904AD3CULL, 0x881B82A13B51B9E2ULL,
+    0x506E6744CD974924ULL, 0xB0183DB56FFC6A79ULL, 0x0ED9B915C66ED37EULL, 0x5E11E86D5873D484ULL,
+    0xF678647E3519AC6EULL, 0x1B85D488D0F20CC5ULL, 0xDAB9FE6525D89021ULL, 0x0D151D86ADB73615ULL,
+    0xA865A54EDCC0F019ULL, 0x93C42566AEF98FFBULL, 0x99E7AFEABE000731ULL, 0x48CBFF086DDF285AULL,
+    0x7F9B6AF1EBF78BAFULL, 0x58627E1A149BBA21ULL, 0x2CD16E2ABD791E33ULL, 0xD363EFF5F0977996ULL,
+    0x0CE2A38C344A6EEDULL, 0x1A804AADB9CFA741ULL, 0x907F30421D78C5DEULL, 0x501F65EDB3034D07ULL,
+    0x37624AE5A48FA6E9ULL, 0x957BAF61700CFF4EULL, 0x3A6C27934E31188AULL, 0xD49503536ABCA345ULL,
+    0x088E049589C432E0ULL, 0xF943AEE7FEBF21B8ULL, 0x6C3B8E3E336139D3ULL, 0x364F6FFA464EE52EULL,
+    0xD60F6DCEDC314222ULL, 0x56963B0DCA418FC0ULL, 0x16F50EDF91E513AFULL, 0xEF1955914B609F93ULL,
+    0x565601C0364E3228ULL, 0xECB53939887E8175ULL, 0xBAC7A9A18531294BULL, 0xB344C470397BBA52ULL,
+    0x65D34954DAF3CEBDULL, 0xB4B81B3FA97511E2ULL, 0xB422061193D6F6A7ULL, 0x071582401C38434DULL,
+    0x7A13F18BBEDC4FF5ULL, 0xBC4097B116C524D2ULL, 0x59B97885E2F2EA28ULL, 0x99170A5DC3115544ULL,
+    0x6F423357E7C6A9F9ULL, 0x325928EE6E6F8794ULL, 0xD0E4366228B03343ULL, 0x565C31F7DE89EA27ULL,
+    0x30F5611484119414ULL, 0xD873DB391292ED4FULL, 0x7BD94E1D8E17DEBCULL, 0xC7D9F16864A76E94ULL,
+    0x947AE053EE56E63CULL, 0xC8C93882F9475F5FULL, 0x3A9BF55BA91F81CAULL, 0xD9A11FBB3D9808E4ULL,
+    0x0FD22063EDC29FCAULL, 0xB3F256D8ACA0B0B9ULL, 0xB03031A8B4516E84ULL, 0x35DD37D5871448AFULL,
+    0xE9F6082B05542E4EULL, 0xEBFAFA33D7254B59ULL, 0x9255ABB50D532280ULL, 0xB9AB4CE57F2D34F3ULL,
+    0x693501D628297551ULL, 0xC62C58F97DD949BFULL, 0xCD454F8F19C5126AULL, 0xBBE83F4ECC2BDECBULL,
+    0xDC842B7E2819E230ULL, 0xBA89142E007503B8ULL, 0xA3BC941D0A5061CBULL, 0xE9F6760E32CD8021ULL,
+    0x09C7E552BC76492FULL, 0x852F54934DA55CC9ULL, 0x8107FCCF064FCF56ULL, 0x098954D51FFF6580ULL,
+    0x23B70EDB1955C4BFULL, 0xC330DE426430F69DULL, 0x4715ED43E8A45C0AULL, 0xA8D7E4DAB780A08DULL,
+    0x0572B974F03CE0BBULL, 0xB57D2E985E1419C7ULL, 0xE8D9ECBE2CF3D73FULL, 0x2FE4B17170E59750ULL,
+    0x11317BA87905E790ULL, 0x7FBF21EC8A1F45ECULL, 0x1725CABFCB045B00ULL, 0x964E915CD5E2B207ULL,
+    0x3E2B8BCBF016D66DULL, 0xBE7444E39328A0ACULL, 0xF85B2B4FBCDE44B7ULL, 0x49353FEA39BA63B1ULL,
+    0x1DD01AAFCD53486AULL, 0x1FCA8A92FD719F85ULL, 0xFC7C95D827357AFAULL, 0x18A6A990C8B35EBDULL,
+    0xCCCB7005C6B9C28DULL, 0x3BDBB92C43B17F26ULL, 0xAA70B5B4F89695A2ULL, 0xE94C39A54A98307FULL,
+    0xB7A0B174CFF6F36EULL, 0xD4DBA84729AF48ADULL, 0x2E18BC1AD9704A68ULL, 0x2DE0966DAF2F8B1CULL,
+    0xB9C11D5B1E43A07EULL, 0x64972D68DEE33360ULL, 0x94628D38D0C20584ULL, 0xDBC0D2B6AB90A559ULL,
+    0xD2733C4335C6A72FULL, 0x7E75D99D94A70F4DULL, 0x6CED1983376FA72BULL, 0x97FCAACBF030BC24ULL,
+    0x7B77497B32503B12ULL, 0x8547EDDFB81CCB94ULL, 0x79999CDFF70902CBULL, 0xCFFE1939438E9B24ULL,
+    0x829626E3892D95D7ULL, 0x92FAE24291F2B3F1ULL, 0x63E22C147B9C3403ULL, 0xC678B6D860284A1CULL,
+    0x5873888850659AE7ULL, 0x0981DCD296A8736DULL, 0x9F65789A6509A440ULL, 0x9FF38FED72E9052FULL,
+    0xE479EE5B9930578CULL, 0xE7F28ECD2D49EECDULL, 0x56C074A581EA17FEULL, 0x5544F7D774B14AEFULL,
+    0x7B3F0195FC6F290FULL, 0x12153635B2C0CF57ULL, 0x7F5126DBBA5E0CA7ULL, 0x7A76956C3EAFB413ULL,
+    0x3D5774A11D31AB39ULL, 0x8A1B083821F40CB4ULL, 0x7B4A38E32537DF62ULL, 0x950113646D1D6E03ULL,
+    0x4DA8979A0041E8A9ULL, 0x3BC36E078F7515D7ULL, 0x5D0A12F27AD310D1ULL, 0x7F9D1A2E1EBE1327ULL,
+    0xDA3A361B1C5157B1ULL, 0xDCDD7D20903D0C25ULL, 0x36833336D068F707ULL, 0xCE68341F79893389ULL,
+    0xAB9090168DD05F34ULL, 0x43954B3252DC25E5ULL, 0xB438C2B67F98E5E9ULL, 0x10DCD78E3851A492ULL,
+    0xDBC27AB5447822BFULL, 0x9B3CDB65F82CA382ULL, 0xB67B7896167B4C84ULL, 0xBFCED1B0048EAC50ULL,
+    0xA9119B60369FFEBDULL, 0x1FFF7AC80904BF45ULL, 0xAC12FB171817EEE7ULL, 0xAF08DA9177DDA93DULL,
+    0x1B0CAB936E65C744ULL, 0xB559EB1D04E5E932ULL, 0xC37B45B3F8D6F2BAULL, 0xC3A9DC228CAAC9E9ULL,
+    0xF3B8B6675A6507FFULL, 0x9FC477DE4ED681DAULL, 0x67378D8ECCEF96CBULL, 0x6DD856D94D259236ULL,
+    0xA319CE15B0B4DB31ULL, 0x073973751F12DD5EULL, 0x8A8E849EB32781A5ULL, 0xE1925C71285279F5ULL,
+    0x74C04BF1790C0EFEULL, 0x4DDA48153C94938AULL, 0x9D266D6A1CC0542CULL, 0x7440FB816508C4FEULL,
+    0x13328503DF48229FULL, 0xD6BF7BAEE43CAC40ULL, 0x4838D65F6EF6748FULL, 0x1E152328F3318DEAULL,
+    0x8F8419A348F296BFULL, 0x72C8834A5957B511ULL, 0xD7A023A73260B45CULL, 0x94EBC8ABCFB56DAEULL,
+    0x9FC10D0F989993E0ULL, 0xDE68A2355B93CAE6ULL, 0xA44CFE79AE538BBEULL, 0x9D1D84FCCE371425ULL,
+    0x51D2B1AB2DDFB636ULL, 0x2FD7E4B9E72CD38CULL, 0x65CA5B96B7552210ULL, 0xDD69A0D8AB3B546DULL,
+    0x604D51B25FBF70E2ULL, 0x73AA8A564FB7AC9EULL, 0x1A8C1E992B941148ULL, 0xAAC40A2703D9BEA0ULL,
+    0x764DBEAE7FA4F3A6ULL, 0x1E99B96E70A9BE8BULL, 0x2C5E9DEB57EF4743ULL, 0x3A938FEE32D29981ULL,
+    0x26E6DB8FFDF5ADFEULL, 0x469356C504EC9F9DULL, 0xC8763C5B08D1908CULL, 0x3F6C6AF859D80055ULL,
+    0x7F7CC39420A3A545ULL, 0x9BFB227EBDF4C5CEULL, 0x89039D79D6FC5C5CULL, 0x8FE88B57305E2AB6ULL,
+    0xA09E8C8C35AB96DEULL, 0xFA7E393983325753ULL, 0xD6B6D0ECC617C699ULL, 0xDFEA21EA9E7557E3ULL,
+    0xB67C1FA481680AF8ULL, 0xCA1E3785A9E724E5ULL, 0x1CFC8BED0D681639ULL, 0xD18D8549D140CAEAULL,
+    0x4ED0FE7E9DC91335ULL, 0xE4DBF0634473F5D2ULL, 0x1761F93A44D5AEFEULL, 0x53898E4C3910DA55ULL,
+    0x734DE8181F6EC39AULL, 0x2680B122BAA28D97ULL, 0x298AF231C85BAFABULL, 0x7983EED3740847D5ULL,
+    0x66C1A2A1A60CD889ULL, 0x9E17E49642A3E4C1ULL, 0xEDB454E7BADC0805ULL, 0x50B704CAB602C329ULL,
+    0x4CC317FB9CDDD023ULL, 0x66B4835D9EAFEA22ULL, 0x219B97E26FFC81BDULL, 0x261E4E4C0A333A9DULL,
+    0x1FE2CCA76517DB90ULL, 0xD7504DFA8816EDBBULL, 0xB9571FA04DC089C8ULL, 0x1DDC0325259B27DEULL,
+    0xCF3F4688801EB9AAULL, 0xF4F5D05C10CAB243ULL, 0x38B6525C21A42B0EULL, 0x36F60E2BA4FA6800ULL,
+    0xEB3593803173E0CEULL, 0x9C4CD6257C5A3603ULL, 0xAF0C317D32ADAA8AULL, 0x258E5A80C7204C4BULL,
+    0x8B889D624D44885DULL, 0xF4D14597E660F855ULL, 0xD4347F66EC8941C3ULL, 0xE699ED85B0DFB40DULL,
+    0x2472F6207C2D0484ULL, 0xC2A1E7B5B459AEB5ULL, 0xAB4F6451CC1D45ECULL, 0x63767572AE3D6174ULL,
+    0xA59E0BD101731A28ULL, 0x116D0016CB948F09ULL, 0x2CF9C8CA052F6E9FULL, 0x0B090A7560A968E3ULL,
+    0xABEEDDB2DDE06FF1ULL, 0x58EFC10B06A2068DULL, 0xC6E57A78FBD986E0ULL, 0x2EAB8CA63CE802D7ULL,
+    0x14A195640116F336ULL, 0x7C0828DD624EC390ULL, 0xD74BBE77E6116AC7ULL, 0x804456AF10F5FB53ULL,
+    0xEBE9EA2ADF4321C7ULL, 0x03219A39EE587A30ULL, 0x49787FEF17AF9924ULL, 0xA1E9300CD8520548ULL,
+    0x5B45E522E4B1B4EFULL, 0xB49C3B3995091A36ULL, 0xD4490AD526F14431ULL, 0x12A8F216AF9418C2ULL,
+    0x001F837CC7350524ULL, 0x1877B51E57A764D5ULL, 0xA2853B80F17F58EEULL, 0x993E1DE72D36D310ULL,
+    0xB3598080CE64A656ULL, 0x252F59CF0D9F04BBULL, 0xD23C8E176D113600ULL, 0x1BDA0492E7E4586EULL,
+    0x21E0BD5026C619BFULL, 0x3B097ADAF088F94EULL, 0x8D14DEDB30BE846EULL, 0xF95CFFA23AF5F6F4ULL,
+    0x3871700761B3F743ULL, 0xCA672B91E9E4FA16ULL, 0x64C8E531BFF53B55ULL, 0x241260ED4AD1E87DULL,
+    0x106C09B972D2E822ULL, 0x7FBA195410E5CA30ULL, 0x7884D9BC6CB569D8ULL, 0x0647DFEDCD894A29ULL,
+    0x63573FF03E224774ULL, 0x4FC8E9560F91B123ULL, 0x1DB956E450275779ULL, 0xB8D91274B9E9D4FBULL,
+    0xA2EBEE47E2FBFCE1ULL, 0xD9F1F30CCD97FB09ULL, 0xEFED53D75FD64E6BULL, 0x2E6D02C36017F67FULL,
+    0xA9AA4D20DB084E9BULL, 0xB64BE8D8B25396C1ULL, 0x70CB6AF7C2D5BCF0ULL, 0x98F076A4F7A2322EULL,
+    0xBF84470805E69B5FULL, 0x94C3251F06F90CF3ULL, 0x3E003E616A6591E9ULL, 0xB925A6CD0421AFF3ULL,
+    0x61BDD1307C66E300ULL, 0xBF8D5108E27E0D48ULL, 0x240AB57A8B888B20ULL, 0xFC87614BAF287E07ULL,
+    0xEF02CDD06FFDB432ULL, 0xA1082C0466DF6C0AULL, 0x8215E577001332C8ULL, 0xD39BB9C3A48DB6CFULL,
+    0x2738259634305C14ULL, 0x61CF4F94C97DF93DULL, 0x1B6BACA2AE4E125BULL, 0x758F450C88572E0BULL,
+    0x959F587D507A8359ULL, 0xB063E962E045F54DULL, 0x60E8ED72C0DFF5D1ULL, 0x7B64978555326F9FULL,
+    0xFD080D236DA814BAULL, 0x8C90FD9B083F4558ULL, 0x106F72FE81E2C590ULL, 0x7976033A39F7D952ULL,
+    0xA4EC0132764CA04BULL, 0x733EA705FAE4FA77ULL, 0xB4D8F77BC3E56167ULL, 0x9E21F4F903B33FD9ULL,
+    0x9D765E419FB69F6DULL, 0xD30C088BA61EA5EFULL, 0x5D94337FBFAF7F5BULL, 0x1A4E4822EB4D7A59ULL,
+    0x6FFE73E81B637FB3ULL, 0xDDF957BC36D8B9CAULL, 0x64D0E29EEA8838B3ULL, 0x08DD9BDFD96B9F63ULL,
+    0x087E79E5A57D1D13ULL, 0xE328E230E3E2B3FBULL, 0x1C2559E30F0946BEULL, 0x720BF5F26F4D2EAAULL,
+    0xB0774D261CC609DBULL, 0x443F64EC5A371195ULL, 0x4112CF68649A260EULL, 0xD813F2FAB7F5C5CAULL,
+    0x660D3257380841EEULL, 0x59AC2C7873F910A3ULL, 0xE846963877671A17ULL, 0x93B633ABFA3469F8ULL,
+    0xC0C0F5A60EF4CDCFULL, 0xCAF21ECD4377B28CULL, 0x57277707199B8175ULL, 0x506C11B9D90E8B1DULL,
+    0xD83CC2687A19255FULL, 0x4A29C6465A314CD1ULL, 0xED2DF21216235097ULL, 0xB5635C95FF7296E2ULL,
+    0x22AF003AB672E811ULL, 0x52E762596BF68235ULL, 0x9AEBA33AC6ECC6B0ULL, 0x944F6DE09134DFB6ULL,
+    0x6C47BEC883A7DE39ULL, 0x6AD047C430A12104ULL, 0xA5B1CFDBA0AB4067ULL, 0x7C45D833AFF07862ULL,
+    0x5092EF950A16DA0BULL, 0x9338E69C052B8E7BULL, 0x455A4B4CFE30E3F5ULL, 0x6B02E63195AD0CF8ULL,
+    0x6B17B224BAD6BF27ULL, 0xD1E0CCD25BB9C169ULL, 0xDE0C89A556B9AE70ULL, 0x50065E535A213CF6ULL,
+    0x9C1169FA2777B874ULL, 0x78EDEFD694AF1EEDULL, 0x6DC93D9526A50E68ULL, 0xEE97F453F06791EDULL,
+    0x32AB0EDB696703D3ULL, 0x3A6853C7E70757A7ULL, 0x31865CED6120F37DULL, 0x67FEF95D92607890ULL,
+    0x1F2B1D1F15F6DC9CULL, 0xB69E38A8965C6B65ULL, 0xAA9119FF184CCCF4ULL, 0xF43C732873F24C13ULL,
+    0xFB4A3D794A9A80D2ULL, 0x3550C2321FD6109CULL, 0x371F77E76BB8417EULL, 0x6BFA9AAE5EC05779ULL,
+    0xCD04F3FF001A4778ULL, 0xE3273522064480CAULL, 0x9F91508BFFCFC14AULL, 0x049A7F41061A9E60ULL,
+    0xFCB6BE43A9F2FE9BULL, 0x08DE8A1C7797DA9BULL, 0x8F9887E6078735A1ULL, 0xB5B4071DBFC73A66ULL,
+    0x230E343DFBA08D33ULL, 0x43ED7F5A0FAE657DULL, 0x3A88A0FBBCB05C63ULL, 0x21874B8B4D2DBC4FULL,
+    0x1BDEA12E35F6A8C9ULL, 0x53C065C6C8E63528ULL, 0xE34A1D250E7A8D6BULL, 0xD6B04D3B7651DD7EULL,
+    0x5E90277E7CB39E2DULL, 0x2C046F22062DC67DULL, 0xB10BB459132D0A26ULL, 0x3FA9DDFB67E2F199ULL,
+    0x0E09B88E1914F7AFULL, 0x10E8B35AF3EEAB37ULL, 0x9EEDECA8E272B933ULL, 0xD4C718BC4AE8AE5FULL,
+    0x81536D601170FC20ULL, 0x91B534F885818A06ULL, 0xEC8177F83F900978ULL, 0x190E714FADA5156EULL,
+    0xB592BF39B0364963ULL, 0x89C350C893AE7DC1ULL, 0xAC042E70F8B383F2ULL, 0xB49B52E587A1EE60ULL,
+    0xFB152FE3FF26DA89ULL, 0x3E666E6F69AE2C15ULL, 0x3B544EBE544C19F9ULL, 0xE805A1E290CF2456ULL,
+    0x24B33C9D7ED25117ULL, 0xE74733427B72F0C1ULL, 0x0A804D18B7097475ULL, 0x57E3306D881EDB4FULL,
+    0x4AE7D6A36EB5DBCBULL, 0x2D8D5432157064C8ULL, 0xD1E649DE1E7F268BULL, 0x8A328A1CEDFE552CULL,
+    0x07A3AEC79624C7DAULL, 0x84547DDC3E203C94ULL, 0x990A98FD5071D263ULL, 0x1A4FF12616EEFC89ULL,
+    0xF6F7FD1431714200ULL, 0x30C05B1BA332F41CULL, 0x8D2636B81555A786ULL, 0x46C9FEB55D120902ULL,
+    0xCCEC0A73B49C9921ULL, 0x4E9D2827355FC492ULL, 0x19EBB029435DCB0FULL, 0x4659D2B743848A2CULL,
+    0x963EF2C96B33BE31ULL, 0x74F85198B05A2E7DULL, 0x5A0F544DD2B1FB18ULL, 0x03727073C2E134B1ULL,
+    0xC7F6AA2DE59AEA61ULL, 0x352787BAA0D7C22FULL, 0x9853EAB63B5E0B35ULL, 0xABBDCDD7ED5C0860ULL,
+    0xCF05DAF5AC8D77B0ULL, 0x49CAD48CEBF4A71EULL, 0x7A4C10EC2158C4A6ULL, 0xD9E92AA246BF719EULL,
+    0x13AE978D09FE5557ULL, 0x730499AF921549FFULL, 0x4E4B705B92903BA4ULL, 0xFF577222C14F0A3AULL,
+    0x55B6344CF97AAFAEULL, 0xB862225B055B6960ULL, 0xCAC09AFBDDD2CDB4ULL, 0xDAF8E9829FE96B5FULL,
+    0xB5FDFC5D3132C498ULL, 0x310CB380DB6F7503ULL, 0xE87FBB46217A360EULL, 0x2102AE466EBB1148ULL,
+    0xF8549E1A3AA5E00DULL, 0x07A69AFDCC42261AULL, 0xC4C118BFE78FEAAEULL, 0xF9F4892ED96BD438ULL,
+    0x1AF3DBE25D8F45DAULL, 0xF5B4B0B0D2DEEEB4ULL, 0x962ACEEFA82E1C84ULL, 0x046E3ECAAF453CE9ULL,
+    0xF05D129681949A4CULL, 0x964781CE734B3C84ULL, 0x9C2ED44081CE5FBDULL, 0x522E23F3925E319EULL,
+    0x177E00F9FC32F791ULL, 0x2BC60A63A6F3B3F2ULL, 0x222BBFAE61725606ULL, 0x486289DDCC3D6780ULL,
+    0x7DC7785B8EFDFC80ULL, 0x8AF38731C02BA980ULL, 0x1FAB64EA29A2DDF7ULL, 0xE4D9429322CD065AULL,
+    0x9DA058C67844F20CULL, 0x24C0E332B70019B0ULL, 0x233003B5A6CFE6ADULL, 0xD586BD01C5C217F6ULL,
+    0x5E5637885F29BC2BULL, 0x7EBA726D8C94094BULL, 0x0A56A5F0BFE39272ULL, 0xD79476A84EE20D06ULL,
+    0x9E4C1269BAA4BF37ULL, 0x17EFEE45B0DEE640ULL, 0x1D95B0A5FCF90BC6ULL, 0x93CBE0B699C2585DULL,
+    0x65FA4F227A2B6D79ULL, 0xD5F9E858292504D5ULL, 0xC2B5A03F71471A6FULL, 0x59300222B4561E00ULL,
+    0xCE2F8642CA0712DCULL, 0x7CA9723FBB2E8988ULL, 0x2785338347F2BA08ULL, 0xC61BB3A141E50E8CULL,
+    0x150F361DAB9DEC26ULL, 0x9F6A419D382595F4ULL, 0x64A53DC924FE7AC9ULL, 0x142DE49FFF7A7C3DULL,
+    0x0C335248857FA9E7ULL, 0x0A9C32D5EAE45305ULL, 0xE6C42178C4BBB92EULL, 0x71F1CE2490D20B07ULL,
+    0xF1BCC3D275AFE51AULL, 0xE728E8C83C334074ULL, 0x96FBF83A12884624ULL, 0x81A1549FD6573DA5ULL,
+    0x5FA7867CAF35E149ULL, 0x56986E2EF3ED091BULL, 0x917F1DD5F8886C61ULL, 0xD20D8C88C8FFE65FULL,
+    0x31D71DCE64B2C310ULL, 0xF165B587DF898190ULL, 0xA57E6339DD2CF3A0ULL, 0x1EF6E6DBB1961EC9ULL,
+    0x70CC73D90BC26E24ULL, 0xE21A6B35DF0C3AD7ULL, 0x003A93D8B2806962ULL, 0x1C99DED33CB890A1ULL,
+    0xCF3145DE0ADD4289ULL, 0xD0E4427A5514FB72ULL, 0x77C621CC9FB3A483ULL, 0x67A34DAC4356550BULL,
+    0xF8D626AAAF278509ULL};
 
 // Generate Polyglot hash key (different from our Zobrist key!)
 U64 get_polyglot_key()
 {
     U64 key = 0ULL;
+
+    // Polyglot piece indexing: bp=0, wp=1, bn=2, wn=3, bb=4, wb=5, br=6, wr=7, bq=8, wq=9, bk=10, wk=11
+    // Our pieces: P=0, N=1, B=2, R=3, Q=4, K=5, p=6, n=7, b=8, r=9, q=10, k=11
+    static const int poly_piece_map[12] = {
+        1,  // P (white pawn) -> wp=1
+        3,  // N (white knight) -> wn=3
+        5,  // B (white bishop) -> wb=5
+        7,  // R (white rook) -> wr=7
+        9,  // Q (white queen) -> wq=9
+        11, // K (white king) -> wk=11
+        0,  // p (black pawn) -> bp=0
+        2,  // n (black knight) -> bn=2
+        4,  // b (black bishop) -> bb=4
+        6,  // r (black rook) -> br=6
+        8,  // q (black queen) -> bq=8
+        10  // k (black king) -> bk=10
+    };
 
     // Pieces on squares
     for (int piece = P; piece <= k; piece++)
@@ -2090,10 +2347,11 @@ U64 get_polyglot_key()
         {
             int sq = get_ls1b_index(bb);
             // Convert our square to Polyglot square (flip rank)
-            int poly_sq = (7 - sq / 8) * 8 + (sq % 8);
-            int poly_piece = (piece < 6) ? (piece * 2) : ((piece - 6) * 2 + 1);
-            if (poly_sq >= 0 && poly_sq < 64)
-                key ^= polyglot_random64[64 * poly_piece + poly_sq];
+            // Our square: a1=0, h1=7, a8=56, h8=63
+            // Polyglot square: a1=0, h1=7, a8=56, h8=63 (same, but rank from white's view)
+            int poly_sq = sq ^ 56; // Flip rank: sq XOR 56 flips rank (0-7 -> 7-0)
+            int poly_piece = poly_piece_map[piece];
+            key ^= polyglot_random64[64 * poly_piece + poly_sq];
             pop_bit(bb, sq);
         }
     }
@@ -2115,7 +2373,7 @@ U64 get_polyglot_key()
         key ^= polyglot_random64[772 + ep_file];
     }
 
-    // Side to move (Polyglot: white = 0, black = 1)
+    // Side to move: In Polyglot, key is XORed when WHITE is to move
     if (side == white)
         key ^= polyglot_random64[780];
 
@@ -3572,9 +3830,6 @@ int quiescence(int alpha, int beta)
     return alpha;
 }
 
-// Track the last move made for counter-move heuristic
-int last_move_made[MAX_PLY];
-
 // Negamax with Alpha-Beta, Killer Moves, History, and Counter-moves
 int negamax(int alpha, int beta, int depth, int ply)
 {
@@ -3744,10 +3999,13 @@ int negamax(int alpha, int beta, int depth, int ply)
         int is_capture = get_move_capture(move_list->moves[count]);
         int is_promotion = get_move_promoted(move_list->moves[count]);
         int is_quiet = !is_capture && !is_promotion;
+        int gives_check = is_square_attacked(
+            (side == white) ? get_ls1b_index(bitboards[k]) : get_ls1b_index(bitboards[K]),
+            side);
 
         // --- LATE MOVE PRUNING (LMP) ---
-        // Skip late quiet moves at low depths if position looks bad
-        if (depth <= 3 && !pv_node && !in_check && is_quiet && moves_searched > lmp_margins[depth])
+        // Skip late quiet moves at low depths
+        if (depth <= 7 && !pv_node && !in_check && !gives_check && is_quiet && moves_searched > lmp_margins[depth < 8 ? depth : 7])
         {
             repetition_index = old_rep_index;
             take_back();
@@ -3756,7 +4014,7 @@ int negamax(int alpha, int beta, int depth, int ply)
 
         // --- FUTILITY PRUNING at move level ---
         // Skip quiet moves that can't possibly raise alpha
-        if (depth <= 6 && !pv_node && !in_check && is_quiet && moves_searched > 1)
+        if (depth <= 6 && !pv_node && !in_check && !gives_check && is_quiet && moves_searched > 1)
         {
             int static_eval = evaluate();
             if (static_eval + futility_margins[depth] <= alpha)
@@ -3768,28 +4026,49 @@ int negamax(int alpha, int beta, int depth, int ply)
         }
 
         // --- SEE PRUNING for bad captures ---
-        if (depth <= 6 && !pv_node && is_capture && !see_ge(move_list->moves[count], -20 * depth))
+        if (depth <= 8 && !pv_node && is_capture && !see_ge(move_list->moves[count], -30 * depth * depth))
         {
             repetition_index = old_rep_index;
             take_back();
             continue;
         }
 
+        // --- EXTENSIONS ---
+        int extension = 0;
+
+        // Check extension (already applied earlier, but boost for discovered checks)
+        if (gives_check)
+            extension = 1;
+
+        // Passed pawn extension
+        if (get_move_piece(move_list->moves[count]) == P || get_move_piece(move_list->moves[count]) == p)
+        {
+            int target = get_move_target(move_list->moves[count]);
+            int rank = target / 8;
+            // 7th rank push (white) or 2nd rank push (black)
+            if ((side == black && rank == 1) || (side == white && rank == 6))
+                extension = 1;
+        }
+
         // PVS + LMR
         if (moves_searched == 1)
         {
             // First move - full window search
-            score = -negamax(-beta, -alpha, depth - 1, ply + 1);
+            score = -negamax(-beta, -alpha, depth - 1 + extension, ply + 1);
         }
         else
         {
             // Late Move Reductions
             int reduction = 0;
 
-            if (moves_searched >= 4 && depth >= 3 && !in_check && is_quiet)
+            if (moves_searched >= 3 && depth >= 3 && !in_check && is_quiet)
             {
-                // Use LMR table
+                // Use LMR table - base reduction
                 reduction = lmr_table[depth < MAX_PLY ? depth : MAX_PLY - 1][moves_searched < 64 ? moves_searched : 63];
+
+                // Reduce less for PV nodes
+                if (pv_node)
+                    reduction--;
 
                 // Reduce less for killer moves
                 if (move_list->moves[count] == killer_moves[0][ply] ||
@@ -3804,11 +4083,18 @@ int negamax(int alpha, int beta, int depth, int ply)
                         reduction--;
                 }
 
-                // Reduce more for moves with bad history
-                if (history_moves[get_move_piece(move_list->moves[count])][get_move_target(move_list->moves[count])] < 0)
+                // Reduce less for moves with good history
+                int hist = history_moves[get_move_piece(move_list->moves[count])][get_move_target(move_list->moves[count])];
+                if (hist > 1000)
+                    reduction--;
+                else if (hist < -1000)
                     reduction++;
 
-                // Don't reduce below 1
+                // Reduce more for non-PV nodes at high depths
+                if (!pv_node && depth > 8)
+                    reduction++;
+
+                // Don't reduce into qsearch, minimum depth 1
                 if (reduction > depth - 2)
                     reduction = depth - 2;
                 if (reduction < 0)
@@ -3816,12 +4102,12 @@ int negamax(int alpha, int beta, int depth, int ply)
             }
 
             // Zero window search with possible reduction
-            score = -negamax(-alpha - 1, -alpha, depth - 1 - reduction, ply + 1);
+            score = -negamax(-alpha - 1, -alpha, depth - 1 - reduction + extension, ply + 1);
 
-            // Re-search if we found a better move
-            if (score > alpha && score < beta)
+            // Re-search with full window if score improved
+            if (score > alpha && (reduction > 0 || score < beta))
             {
-                score = -negamax(-beta, -alpha, depth - 1, ply + 1);
+                score = -negamax(-beta, -alpha, depth - 1 + extension, ply + 1);
             }
         }
 
@@ -3848,30 +4134,77 @@ int negamax(int alpha, int beta, int depth, int ply)
 
         if (score >= beta)
         {
-            // Update killer, history, and counter-moves for quiet moves that cause cutoff
-            if (is_quiet)
-            {
-                // Killer moves
-                killer_moves[1][ply] = killer_moves[0][ply];
-                killer_moves[0][ply] = move_list->moves[count];
+            int move = move_list->moves[count];
+            int piece = get_move_piece(move);
+            int target = get_move_target(move);
+            int from = get_move_source(move);
 
-                // History bonus
-                int bonus = depth * depth;
-                history_moves[get_move_piece(move_list->moves[count])][get_move_target(move_list->moves[count])] += bonus;
+            // Depth-based bonus (quadratic scaling is stronger)
+            int bonus = depth * depth;
+            if (bonus > 400)
+                bonus = 400; // Cap to prevent overflow
+
+            if (is_capture)
+            {
+                // Update capture history for good captures
+                int victim = P;
+                int start = (side == white) ? p : P;
+                int end = (side == white) ? k : K;
+                for (int p = start; p <= end; p++)
+                {
+                    if (get_bit(bitboards[p], target))
+                    {
+                        victim = p;
+                        break;
+                    }
+                }
+                capture_history[piece][target][victim % 6] += bonus * 4;
+                // Clamp
+                if (capture_history[piece][target][victim % 6] > history_max)
+                    capture_history[piece][target][victim % 6] = history_max;
+            }
+            else
+            {
+                // Quiet move caused cutoff - update killer, history, counter-move
+
+                // Killer moves
+                if (move != killer_moves[0][ply])
+                {
+                    killer_moves[1][ply] = killer_moves[0][ply];
+                    killer_moves[0][ply] = move;
+                }
+
+                // History bonus with gravity
+                history_moves[piece][target] += bonus;
+                if (history_moves[piece][target] > history_max)
+                    history_moves[piece][target] = history_max;
 
                 // Butterfly history
-                int from = get_move_source(move_list->moves[count]);
-                int to = get_move_target(move_list->moves[count]);
-                butterfly_history[side][from][to] += bonus;
+                butterfly_history[side][from][target] += bonus;
+                if (butterfly_history[side][from][target] > history_max)
+                    butterfly_history[side][from][target] = history_max;
 
                 // Counter-move
                 if (ply > 0 && last_move_made[ply - 1])
                 {
                     int lm = last_move_made[ply - 1];
-                    counter_moves[get_move_piece(lm)][get_move_target(lm)] = move_list->moves[count];
+                    counter_moves[get_move_piece(lm)][get_move_target(lm)] = move;
+                }
+
+                // History malus for all other quiet moves searched (they failed to cause cutoff)
+                for (int i = 0; i < count; i++)
+                {
+                    int bad_move = move_list->moves[i];
+                    if (!get_move_capture(bad_move) && bad_move != move)
+                    {
+                        history_moves[get_move_piece(bad_move)][get_move_target(bad_move)] -= bonus / 2;
+                        if (history_moves[get_move_piece(bad_move)][get_move_target(bad_move)] < -history_max)
+                            history_moves[get_move_piece(bad_move)][get_move_target(bad_move)] = -history_max;
+                    }
                 }
             }
-            write_tt(depth, beta, HASH_BETA, move_list->moves[count], ply);
+
+            write_tt(depth, beta, HASH_BETA, move, ply);
             return beta;
         }
 
@@ -3988,37 +4321,34 @@ void uci_loop()
         // Handle "stop" command - stop pondering or search
         if (strncmp(input, "stop", 4) == 0)
         {
-            if (pondering)
-            {
-                stop_pondering = 1;
-                pthread_join(ponder_thread, NULL);
-                pondering = 0;
-            }
+            stop_pondering = 1;
             times_up = 1;
+            // Note: The search will stop on next communicate() check
+            // and output bestmove in the go handler
             continue;
         }
 
         // Handle "ponderhit" - opponent played our expected move!
         if (strncmp(input, "ponderhit", 9) == 0)
         {
-            if (pondering)
-            {
-                ponder_hit = 1;
-                pondering = 0; // Switch to normal search with time management
-            }
+            // Signal that opponent played expected move
+            // Search will continue with proper time management
+            ponder_hit = 1;
+            // Time will be set from the subsequent go command or use default
             continue;
         }
 
         if (strncmp(input, "isready", 7) == 0)
         {
-            // Wait for any pondering to complete
-            if (pondering)
-            {
-                stop_pondering = 1;
-                pthread_join(ponder_thread, NULL);
-                pondering = 0;
-            }
+            // If currently searching/pondering, signal stop first
+            stop_pondering = 1;
+            times_up = 1;
+            // Small delay to let search finish cleanly
+            usleep(10000); // 10ms
+            pondering = 0;
+            stop_pondering = 0;
             printf("readyok\n");
+            fflush(stdout);
             continue;
         }
         else if (strncmp(input, "setoption", 9) == 0)
@@ -4141,16 +4471,14 @@ void uci_loop()
 
         else if (strncmp(input, "go", 2) == 0)
         {
-            // Stop any existing pondering
-            if (pondering)
-            {
-                stop_pondering = 1;
-                pthread_join(ponder_thread, NULL);
-                pondering = 0;
-            }
+            // Reset pondering state for new search
+            stop_pondering = 0;
+            ponder_hit = 0;
+            times_up = 0;
 
             // Check if this is a ponder command
             int is_ponder = (strstr(input, "ponder") != NULL);
+            pondering = is_ponder;
 
             // Check opening book first (but not when pondering)
             if (use_book && !is_ponder)
@@ -4162,6 +4490,7 @@ void uci_loop()
                     printf("bestmove ");
                     print_move(book_move);
                     printf("\n");
+                    fflush(stdout);
                     continue;
                 }
             }
@@ -4212,34 +4541,70 @@ void uci_loop()
             }
             else if (time != -1 && !infinite)
             {
-                // Dynamic time management
-                // Base time: time / expected_moves
-                int expected_moves = (movestogo > 0) ? movestogo : 25;
+                // ========================================
+                // IMPROVED TIME MANAGEMENT
+                // ========================================
 
-                // Use more time early in the game, less when low on time
+                // Estimate game phase based on material
+                int phase = count_bits(bitboards[N] | bitboards[n]) +
+                            count_bits(bitboards[B] | bitboards[b]) +
+                            count_bits(bitboards[R] | bitboards[r]) * 2 +
+                            count_bits(bitboards[Q] | bitboards[q]) * 4;
+
+                // Expected moves to end of game
+                int expected_moves;
+                if (movestogo > 0)
+                {
+                    expected_moves = movestogo;
+                }
+                else
+                {
+                    // Dynamic estimate based on game phase
+                    // Early game (full material): expect ~40 more moves
+                    // Endgame (low material): expect ~20 more moves
+                    expected_moves = 20 + phase;
+                    if (expected_moves > 50)
+                        expected_moves = 50;
+                    if (expected_moves < 15)
+                        expected_moves = 15;
+                }
+
+                // Base time allocation
                 time_for_move = time / expected_moves;
 
-                // Add some increment
-                time_for_move += inc * 3 / 4;
+                // Add increment (use most of it)
+                if (inc > 0)
+                    time_for_move += inc * 4 / 5;
 
-                // Don't use more than 1/4 of remaining time
-                if (time_for_move > time / 4)
-                    time_for_move = time / 4;
+                // Use more time in complex positions (when we have more pieces)
+                if (phase > 16)
+                    time_for_move = time_for_move * 11 / 10;
 
-                // Safety buffer - more aggressive at higher times
-                int safety = 50;
-                if (time < 5000)
-                    safety = 20; // Low time
+                // Cap at reasonable fraction of remaining time
+                long long max_time;
+                if (time > 60000)
+                    max_time = time / 5; // > 1 min: use up to 20%
+                else if (time > 10000)
+                    max_time = time / 6; // > 10s: use up to 16%
+                else if (time > 3000)
+                    max_time = time / 8; // > 3s: use up to 12%
+                else
+                    max_time = time / 10; // Low time: use up to 10%
+
+                if (time_for_move > max_time)
+                    time_for_move = max_time;
+
+                // Safety buffer
+                int safety = 30;
+                if (time < 3000)
+                    safety = 10;
                 if (time < 1000)
-                    safety = 5; // Very low time
-
+                    safety = 5;
                 time_for_move -= safety;
+
+                // Minimum time
                 if (time_for_move < 10)
                     time_for_move = 10;
-
-                // Hard limit: never use more than 90% of remaining time
-                if (time_for_move > time * 9 / 10)
-                    time_for_move = time * 9 / 10;
             }
             else
             {
@@ -4256,16 +4621,26 @@ void uci_loop()
             times_up = 0;
             nodes = 0;
 
-            // Clear history table aging (prevent overflow)
+            // Age history tables (prevent overflow, help with move ordering freshness)
             for (int i = 0; i < 12; i++)
+            {
                 for (int j = 0; j < 64; j++)
+                {
                     history_moves[i][j] /= 2;
+                    for (int k = 0; k < 6; k++)
+                        capture_history[i][j][k] /= 2;
+                }
+            }
+            for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 64; j++)
+                    for (int k = 0; k < 64; k++)
+                        butterfly_history[i][j][k] /= 2;
 
             printf("info string Time allocated: %lld ms\n", time_for_move);
 
             // 7. Iterative Deepening with Aspiration Windows
             int prev_score = 0;
-            int aspiration_window = 50;
+            int aspiration_window = 25; // Smaller window for faster search
 
             for (int current_depth = 1; current_depth <= search_depth; current_depth++)
             {
@@ -4275,15 +4650,31 @@ void uci_loop()
                 int alpha, beta;
                 int score;
 
-                // Aspiration windows - only after depth 4
-                if (current_depth >= 4)
+                // Aspiration windows - only after depth 5
+                if (current_depth >= 5)
                 {
                     alpha = prev_score - aspiration_window;
                     beta = prev_score + aspiration_window;
 
                     score = negamax(alpha, beta, current_depth, 0);
 
-                    // Failed low or high - re-search with full window
+                    // Failed low - widen window and re-search
+                    if (!times_up && score <= alpha)
+                    {
+                        alpha = prev_score - aspiration_window * 4;
+                        if (alpha < -INF)
+                            alpha = -INF;
+                        score = negamax(alpha, beta, current_depth, 0);
+                    }
+                    // Failed high - widen window and re-search
+                    if (!times_up && score >= beta)
+                    {
+                        beta = prev_score + aspiration_window * 4;
+                        if (beta > INF)
+                            beta = INF;
+                        score = negamax(alpha, beta, current_depth, 0);
+                    }
+                    // Still failing - full window search
                     if (!times_up && (score <= alpha || score >= beta))
                     {
                         score = negamax(-INF, INF, current_depth, 0);
@@ -4325,14 +4716,27 @@ void uci_loop()
                     printf(" ");
                 }
                 printf("\n");
+                fflush(stdout);
 
-                // Soft time management - stop if we've used enough time
-                // But keep searching if we found a potential mate
-                if (time_for_move != -1 && elapsed > time_for_move / 2 && score < MATE - 100)
-                    break;
+                // Soft time management with smarter conditions
+                if (time_for_move != -1)
+                {
+                    // If we found a mate, keep searching until time runs out
+                    if (score > MATE - 100 || score < -MATE + 100)
+                        continue;
+
+                    // If we've used > 60% of time and depth >= 8, consider stopping
+                    if (elapsed > time_for_move * 6 / 10 && current_depth >= 8)
+                        break;
+
+                    // If we've used > 80% of time, definitely stop
+                    if (elapsed > time_for_move * 8 / 10)
+                        break;
+                }
             }
 
             // 8. Output Final Best Move with ponder move if available
+            pondering = 0; // Reset pondering state
             printf("bestmove ");
             if (best_move)
                 print_move(best_move);
@@ -4347,21 +4751,18 @@ void uci_loop()
                 ponder_move = pv_table[0][1];
             }
             printf("\n");
+            fflush(stdout); // Ensure output is sent immediately!
         }
 
         else if (strncmp(input, "quit", 4) == 0)
         {
-            // Stop any pondering before quitting
-            if (pondering)
-            {
-                stop_pondering = 1;
-                pthread_join(ponder_thread, NULL);
-            }
+            stop_pondering = 1;
+            times_up = 1;
             break;
         }
         else if (strncmp(input, "uci", 3) == 0)
         {
-            printf("id name Fe64-Boa v3.0\n");
+            printf("id name Fe64-Boa v3.0\\n");
             printf("id author Syed Masood\n");
             printf("option name Hash type spin default 64 min 1 max 4096\n");
             printf("option name Contempt type spin default 10 min -100 max 100\n");

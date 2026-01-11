@@ -5,16 +5,15 @@ engine:
   dir: "/home/syedmasoodhussain/Desktop/chess_engine/bin/"
   name: "bbc"
   protocol: "uci"
-  ponder: true # Enable pondering - think on opponent's time!
+  ponder: false # Pondering disabled for stability
 
-  # ONLY use options your engine actually supports!
-  # Hash and Threads are removed because your code doesn't declare them yet.
+  # UCI Options
   uci_options:
-    OwnBook: true
-    Ponder: true
-    UseNNUE: false # Disabled - use HCE until NNUE is properly trained
+    OwnBook: true # Use internal Polyglot book
+    Ponder: false # Disabled for stability
+    UseNNUE: false # Use HCE - stronger than untrained NNUE
     Hash: 256
-    Contempt: 20
+    Contempt: 15 # Slightly prefer winning over drawing
 
 matchmaking:
   allow_matchmaking: true
