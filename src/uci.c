@@ -313,6 +313,7 @@ void uci_loop()
             start_time = get_time_ms();
             times_up = 0;
             nodes = 0;
+            best_move = 0; // Reset best move before search
 
             // Age history tables
             for (int i = 0; i < 12; i++)
@@ -337,7 +338,8 @@ void uci_loop()
 
             for (int current_depth = 1; current_depth <= search_depth; current_depth++)
             {
-                if (times_up)
+                // Only allow time-based exit after completing at least depth 1
+                if (times_up && current_depth > 1)
                     break;
 
                 int alpha, beta;

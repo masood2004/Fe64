@@ -20,6 +20,7 @@
 #else
 #include <unistd.h>
 #include <sys/select.h>
+#include <fcntl.h>
 #endif
 
 // ============================================ \\

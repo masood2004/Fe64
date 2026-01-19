@@ -365,8 +365,8 @@ int score_move(int move, int pv_move, int ply)
 
 int quiescence(int alpha, int beta)
 {
-    // Time check
-    if ((nodes & 2047) == 0)
+    // Time check - check more frequently (every 1024 nodes)
+    if ((nodes & 1023) == 0)
         communicate();
     if (times_up)
         return 0;
@@ -460,8 +460,8 @@ int negamax(int alpha, int beta, int depth, int ply)
     // Is this a PV node?
     int pv_node = (beta - alpha > 1);
 
-    // Time check
-    if ((nodes & 2047) == 0)
+    // Time check - check more frequently (every 1024 nodes)
+    if ((nodes & 1023) == 0)
         communicate();
     if (times_up)
         return 0;
@@ -492,8 +492,9 @@ int negamax(int alpha, int beta, int depth, int ply)
         (side == white) ? get_ls1b_index(bitboards[K]) : get_ls1b_index(bitboards[k]),
         side ^ 1);
 
-    // Check extension
-    if (in_check)
+    // Check extension - but limit to prevent explosion
+    // Only extend if we're not too deep already
+    if (in_check && depth < MAX_PLY / 2)
         depth++;
 
     // Null move pruning
@@ -794,6 +795,11 @@ int negamax(int alpha, int beta, int depth, int ply)
             alpha = score;
             if (ply == 0)
                 best_move = move_list->moves[count];
+        }
+        // At ply 0, always ensure we have a move to play (first legal move found)
+        else if (ply == 0 && best_move == 0)
+        {
+            best_move = move_list->moves[count];
         }
     }
 

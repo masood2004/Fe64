@@ -373,6 +373,24 @@ long long get_time_ms()
     return tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+// Static buffer for non-blocking input reading
+static char input_buffer[256];
+static int input_buffer_pos = 0;
+static int stdin_nonblocking_set = 0;
+
+// Set stdin to non-blocking mode
+void set_stdin_nonblocking()
+{
+#ifndef _WIN32
+    if (!stdin_nonblocking_set)
+    {
+        int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+        fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+        stdin_nonblocking_set = 1;
+    }
+#endif
+}
+
 int input_waiting()
 {
 #ifdef _WIN32
@@ -399,32 +417,85 @@ int input_waiting()
 #endif
 }
 
+// Non-blocking read of a complete line
+// Returns 1 if a complete line was read, 0 otherwise
+int read_line_nonblocking(char *output, int max_len)
+{
+    // Ensure stdin is non-blocking
+    set_stdin_nonblocking();
+
+    // Try to read available characters
+    char c;
+    while (1)
+    {
+        ssize_t bytes_read = read(STDIN_FILENO, &c, 1);
+
+        if (bytes_read <= 0)
+        {
+            // No more data available or error
+            break;
+        }
+
+        if (c == '\n' || c == '\r')
+        {
+            if (input_buffer_pos > 0)
+            {
+                input_buffer[input_buffer_pos] = '\0';
+                strncpy(output, input_buffer, max_len - 1);
+                output[max_len - 1] = '\0';
+                input_buffer_pos = 0;
+                return 1;
+            }
+        }
+        else if (input_buffer_pos < (int)sizeof(input_buffer) - 1)
+        {
+            input_buffer[input_buffer_pos++] = c;
+        }
+    }
+    return 0;
+}
+
 void communicate()
 {
     if (times_up)
         return;
 
-    if (input_waiting())
+    // ALWAYS check time first before anything else - hard time limit
+    if (time_for_move != -1 && !pondering)
     {
-        char input[256];
-        if (fgets(input, sizeof(input), stdin))
+        long long elapsed = get_time_ms() - start_time;
+        // Hard cutoff: if we've exceeded our time, stop immediately
+        if (elapsed > time_for_move)
         {
-            if (strncmp(input, "stop", 4) == 0)
-            {
-                times_up = 1;
-                stop_pondering = 1;
-                return;
-            }
-            else if (strncmp(input, "quit", 4) == 0)
-            {
-                times_up = 1;
-                stop_pondering = 1;
-                return;
-            }
-            else if (strncmp(input, "ponderhit", 9) == 0)
-            {
-                ponder_hit = 1;
-            }
+            times_up = 1;
+            return;
+        }
+        // Extra hard cutoff: never exceed 3x allocated time
+        if (elapsed > time_for_move * 3)
+        {
+            times_up = 1;
+            return;
+        }
+    }
+
+    char input[256];
+    if (read_line_nonblocking(input, sizeof(input)))
+    {
+        if (strncmp(input, "stop", 4) == 0)
+        {
+            times_up = 1;
+            stop_pondering = 1;
+            return;
+        }
+        else if (strncmp(input, "quit", 4) == 0)
+        {
+            times_up = 1;
+            stop_pondering = 1;
+            return;
+        }
+        else if (strncmp(input, "ponderhit", 9) == 0)
+        {
+            ponder_hit = 1;
         }
     }
 
@@ -443,13 +514,6 @@ void communicate()
 
     if (pondering)
         return;
-    if (time_for_move == -1)
-        return;
-
-    if ((get_time_ms() - start_time) > time_for_move)
-    {
-        times_up = 1;
-    }
 }
 
 // Initialize LMR table
