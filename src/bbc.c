@@ -4762,7 +4762,7 @@ void uci_loop()
         }
         else if (strncmp(input, "uci", 3) == 0)
         {
-            printf("id name Fe64-Boa v3.0\\n");
+            printf("id name Fe64 v4.0 - The Boa Constrictor\n");
             printf("id author Syed Masood\n");
             printf("option name Hash type spin default 64 min 1 max 4096\n");
             printf("option name Contempt type spin default 10 min -100 max 100\n");

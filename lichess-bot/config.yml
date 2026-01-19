@@ -3,17 +3,18 @@ token: "lip_QMZJKSsJ6HsihDgP7BgK"
 
 engine:
   dir: "/home/syedmasoodhussain/Desktop/chess_engine/bin/"
-  name: "bbc"
+  name: "fe64"
   protocol: "uci"
-  ponder: false # Pondering disabled for stability
+  ponder: true # Pondering ENABLED - Fixed in Fe64 v4.0
 
-  # UCI Options
+  # UCI Options for Fe64 "The Boa Constrictor"
   uci_options:
-    OwnBook: true # Use internal Polyglot book
-    Ponder: false # Disabled for stability
-    UseNNUE: false # Use HCE - stronger than untrained NNUE
     Hash: 256
-    Contempt: 15 # Slightly prefer winning over drawing
+    Ponder: true # Enable pondering for stronger play
+    Book: true # Use opening book
+    BookVariety: 1 # Weighted random book selection
+    Contempt: 24 # Prefer winning over drawing
+    BoaAggression: 50 # Balanced Boa Constrictor style
 
 matchmaking:
   allow_matchmaking: true
