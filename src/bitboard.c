@@ -1,0 +1,465 @@
+// ============================================ \\
+//       FE64 CHESS ENGINE - BITBOARD OPS       \\
+// ============================================ \\
+
+#include "types.h"
+
+// ============================================ \\
+//           GLOBAL VARIABLE DEFINITIONS        \\
+// ============================================ \\
+
+// Attack Tables
+U64 pawn_attacks[2][64];
+U64 knight_attacks[64];
+U64 king_attacks[64];
+U64 bishop_masks[64];
+U64 rook_masks[64];
+U64 bishop_attacks_table[64][512];
+U64 rook_attacks_table[64][4096];
+U64 bishop_magic_numbers[64];
+U64 rook_magic_numbers[64];
+
+// Board State
+U64 bitboards[12];
+U64 occupancies[3];
+int side;
+int en_passant = no_sq;
+int castle;
+
+// Zobrist Hashing
+U64 piece_keys[12][64];
+U64 side_key;
+U64 castle_keys[16];
+U64 enpassant_keys[64];
+U64 hash_key;
+
+// Repetition Detection
+U64 repetition_table[MAX_GAME_MOVES];
+int repetition_index = 0;
+
+// Transposition Table
+tt_entry transposition_table[TT_SIZE];
+
+// Search State
+int best_move;
+long long nodes;
+int pv_length[MAX_PLY];
+int pv_table[MAX_PLY][MAX_PLY];
+int killer_moves[2][64];
+int history_moves[12][64];
+int counter_moves[12][64];
+int butterfly_history[2][64][64];
+int capture_history[12][64][6];
+int last_move_made[MAX_PLY];
+int lmr_table[MAX_PLY][64];
+
+// Timing
+long long start_time;
+long long stop_time;
+long long time_for_move;
+int times_up = 0;
+
+// Pondering
+volatile int pondering = 0;
+volatile int stop_pondering = 0;
+int ponder_move = 0;
+int ponder_hit = 0;
+long long ponder_time_for_move = -1;
+pthread_mutex_t search_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// UCI Options
+int hash_size_mb = 64;
+int multi_pv = 1;
+int use_nnue_eval = 0;
+int contempt = 10;
+int use_book = 1;
+
+// Constants
+char *start_position = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+char ascii_pieces[12] = "PNBRQKpnbrqk";
+
+const int castling_rights[64] = {
+    7, 15, 15, 15, 3, 15, 15, 11,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    13, 15, 15, 15, 12, 15, 15, 14};
+
+const int see_piece_values[12] = {
+    100, 320, 330, 500, 900, 20000,
+    100, 320, 330, 500, 900, 20000};
+
+const int lmp_margins[8] = {0, 5, 8, 12, 18, 25, 33, 42};
+const int futility_margins[7] = {0, 100, 160, 220, 280, 340, 400};
+const int razor_margins[4] = {0, 125, 250, 375};
+const int rfp_margins[7] = {0, 70, 140, 210, 280, 350, 420};
+const int history_max = 16384;
+
+// Piece-Square Tables
+const int pawn_score[64] = {
+    90, 90, 90, 90, 90, 90, 90, 90,
+    30, 30, 30, 40, 40, 30, 30, 30,
+    20, 20, 20, 30, 30, 20, 20, 20,
+    10, 10, 10, 20, 20, 10, 10, 10,
+    5, 5, 10, 20, 20, 5, 5, 5,
+    0, 0, 0, 5, 5, 0, 0, 0,
+    0, 0, 0, -10, -10, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0};
+
+const int knight_score[64] = {
+    -50, -40, -30, -30, -30, -30, -40, -50,
+    -40, -20, 0, 0, 0, 0, -20, -40,
+    -30, 0, 10, 15, 15, 10, 0, -30,
+    -30, 5, 15, 20, 20, 15, 5, -30,
+    -30, 0, 15, 20, 20, 15, 0, -30,
+    -30, 5, 10, 15, 15, 10, 5, -30,
+    -40, -20, 0, 5, 5, 0, -20, -40,
+    -50, -40, -30, -30, -30, -30, -40, -50};
+
+const int bishop_score[64] = {
+    -20, -10, -10, -10, -10, -10, -10, -20,
+    -10, 0, 0, 0, 0, 0, 0, -10,
+    -10, 0, 5, 10, 10, 5, 0, -10,
+    -10, 5, 5, 10, 10, 5, 5, -10,
+    -10, 0, 10, 10, 10, 10, 0, -10,
+    -10, 10, 10, 10, 10, 10, 10, -10,
+    -10, 5, 0, 0, 0, 0, 5, -10,
+    -20, -10, -10, -10, -10, -10, -10, -20};
+
+const int rook_score[64] = {
+    0, 0, 0, 0, 0, 0, 0, 0,
+    5, 10, 10, 10, 10, 10, 10, 5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    0, 0, 0, 5, 5, 0, 0, 0};
+
+const int king_score[64] = {
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -20, -30, -30, -40, -40, -30, -30, -20,
+    -10, -20, -20, -20, -20, -20, -20, -10,
+    20, 20, 0, 0, 0, 0, 20, 20,
+    20, 30, 10, 0, 0, 10, 30, 20};
+
+const int king_endgame_score[64] = {
+    -50, -40, -30, -20, -20, -30, -40, -50,
+    -30, -20, -10, 0, 0, -10, -20, -30,
+    -30, -10, 20, 30, 30, 20, -10, -30,
+    -30, -10, 30, 40, 40, 30, -10, -30,
+    -30, -10, 30, 40, 40, 30, -10, -30,
+    -30, -10, 20, 30, 30, 20, -10, -30,
+    -30, -30, 0, 0, 0, 0, -30, -30,
+    -50, -30, -30, -30, -30, -30, -30, -50};
+
+const int passed_pawn_bonus[8] = {0, 120, 80, 50, 30, 15, 15, 0};
+const int passed_pawn_bonus_eg[8] = {0, 200, 150, 100, 60, 30, 15, 0};
+
+int material_weights[12] = {
+    100, 320, 330, 500, 950, 20000,
+    -100, -320, -330, -500, -950, -20000};
+
+// File masks
+const U64 not_a_file = 18374403900871474942ULL;
+const U64 not_h_file = 9187201950435737471ULL;
+const U64 not_ab_file = 18229723555195321596ULL;
+const U64 not_gh_file = 4557430888798830399ULL;
+
+// ============================================ \\
+//           RANDOM NUMBER GENERATION           \\
+// ============================================ \\
+
+unsigned int random_state = 1804289383;
+
+unsigned int get_random_U32_number()
+{
+    unsigned int number = random_state;
+    number ^= number << 13;
+    number ^= number >> 17;
+    number ^= number << 5;
+    random_state = number;
+    return number;
+}
+
+U64 get_random_U64_number()
+{
+    U64 n1 = (U64)(get_random_U32_number()) & 0xFFFF;
+    U64 n2 = (U64)(get_random_U32_number()) & 0xFFFF;
+    U64 n3 = (U64)(get_random_U32_number()) & 0xFFFF;
+    U64 n4 = (U64)(get_random_U32_number()) & 0xFFFF;
+    return n1 | (n2 << 16) | (n3 << 32) | (n4 << 48);
+}
+
+U64 generate_magic_candidate()
+{
+    return get_random_U64_number() & get_random_U64_number() & get_random_U64_number();
+}
+
+// ============================================ \\
+//           ZOBRIST HASHING                    \\
+// ============================================ \\
+
+void init_hash_keys()
+{
+    random_state = 1804289383;
+    for (int p = P; p <= k; p++)
+        for (int s = 0; s < 64; s++)
+            piece_keys[p][s] = get_random_U64_number();
+    side_key = get_random_U64_number();
+    for (int i = 0; i < 16; i++)
+        castle_keys[i] = get_random_U64_number();
+    for (int i = 0; i < 64; i++)
+        enpassant_keys[i] = get_random_U64_number();
+}
+
+U64 generate_hash_key()
+{
+    U64 final_key = 0ULL;
+    for (int p = P; p <= k; p++)
+    {
+        U64 bitboard = bitboards[p];
+        while (bitboard)
+        {
+            int sq = get_ls1b_index(bitboard);
+            final_key ^= piece_keys[p][sq];
+            pop_bit(bitboard, sq);
+        }
+    }
+    if (side == black)
+        final_key ^= side_key;
+    if (en_passant != no_sq)
+        final_key ^= enpassant_keys[en_passant];
+    final_key ^= castle_keys[castle];
+    return final_key;
+}
+
+int is_repetition()
+{
+    for (int i = repetition_index - 2; i >= 0; i -= 2)
+    {
+        if (repetition_table[i] == hash_key)
+            return 1;
+    }
+    return 0;
+}
+
+// ============================================ \\
+//           TRANSPOSITION TABLE                \\
+// ============================================ \\
+
+void clear_tt()
+{
+    memset(transposition_table, 0, sizeof(transposition_table));
+}
+
+int read_tt(int alpha, int beta, int depth, int ply)
+{
+    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
+    if (entry->key == hash_key)
+    {
+        if (entry->depth >= depth)
+        {
+            int score = entry->value;
+            if (score > MATE - 100)
+                score -= ply;
+            if (score < -MATE + 100)
+                score += ply;
+            if (entry->flags == HASH_EXACT)
+                return score;
+            if (entry->flags == HASH_ALPHA && score <= alpha)
+                return alpha;
+            if (entry->flags == HASH_BETA && score >= beta)
+                return beta;
+        }
+    }
+    return -INF - 1;
+}
+
+int get_tt_move()
+{
+    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
+    if (entry->key == hash_key)
+        return entry->best_move;
+    return 0;
+}
+
+void write_tt(int depth, int value, int flags, int move, int ply)
+{
+    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
+    if (entry->key != hash_key || entry->depth <= depth)
+    {
+        int score_to_store = value;
+        if (value > MATE - 100)
+            score_to_store += ply;
+        if (value < -MATE + 100)
+            score_to_store -= ply;
+        entry->key = hash_key;
+        entry->depth = depth;
+        entry->flags = flags;
+        entry->value = score_to_store;
+        entry->best_move = move;
+    }
+}
+
+// ============================================ \\
+//           HELPER FUNCTIONS                   \\
+// ============================================ \\
+
+void print_bitboard(U64 bitboard)
+{
+    printf("\n");
+    for (int rank = 0; rank < 8; rank++)
+    {
+        for (int file = 0; file < 8; file++)
+        {
+            if (file == 0)
+                printf("  %d ", 8 - rank);
+            int square = rank * 8 + file;
+            printf(" %d", get_bit(bitboard, square) ? 1 : 0);
+        }
+        printf("\n");
+    }
+    printf("\n     a b c d e f g h \n\n");
+    printf("     Bitboard: %llu\n\n", bitboard);
+}
+
+void print_board()
+{
+    printf("\n");
+    for (int rank = 0; rank < 8; rank++)
+    {
+        for (int file = 0; file < 8; file++)
+        {
+            int square = rank * 8 + file;
+            if (!file)
+                printf("  %d ", 8 - rank);
+            int piece = -1;
+            for (int bb_piece = P; bb_piece <= k; bb_piece++)
+            {
+                if (get_bit(bitboards[bb_piece], square))
+                {
+                    piece = bb_piece;
+                }
+            }
+            printf(" %c", (piece == -1) ? '.' : ascii_pieces[piece]);
+        }
+        printf("\n");
+    }
+    printf("\n     a b c d e f g h \n\n");
+    printf("     Side:     %s\n", !side ? "white" : "black");
+    printf("     EnPassant:   %s\n", (en_passant != no_sq) ? "Yes" : "no");
+    printf("     Castling:  %c%c%c%c\n\n",
+           (castle & wk) ? 'K' : '-',
+           (castle & wq) ? 'Q' : '-',
+           (castle & bk) ? 'k' : '-',
+           (castle & bq) ? 'q' : '-');
+}
+
+// ============================================ \\
+//           TIME MANAGEMENT                    \\
+// ============================================ \\
+
+long long get_time_ms()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+int input_waiting()
+{
+#ifdef _WIN32
+    static int init = 0;
+    static HANDLE h;
+    DWORD mode;
+    if (!init)
+    {
+        init = 1;
+        h = GetStdHandle(STD_INPUT_HANDLE);
+        GetConsoleMode(h, &mode);
+        SetConsoleMode(h, mode & ~(ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT));
+        FlushConsoleInputBuffer(h);
+    }
+    return _kbhit();
+#else
+    fd_set readfds;
+    struct timeval tv;
+    FD_ZERO(&readfds);
+    FD_SET(STDIN_FILENO, &readfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    return select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv) > 0;
+#endif
+}
+
+void communicate()
+{
+    if (times_up)
+        return;
+
+    if (input_waiting())
+    {
+        char input[256];
+        if (fgets(input, sizeof(input), stdin))
+        {
+            if (strncmp(input, "stop", 4) == 0)
+            {
+                times_up = 1;
+                stop_pondering = 1;
+                return;
+            }
+            else if (strncmp(input, "quit", 4) == 0)
+            {
+                times_up = 1;
+                stop_pondering = 1;
+                return;
+            }
+            else if (strncmp(input, "ponderhit", 9) == 0)
+            {
+                ponder_hit = 1;
+            }
+        }
+    }
+
+    if (stop_pondering)
+    {
+        times_up = 1;
+        return;
+    }
+
+    if (pondering && ponder_hit && ponder_time_for_move != -1)
+    {
+        pondering = 0;
+        time_for_move = ponder_time_for_move;
+        start_time = get_time_ms();
+    }
+
+    if (pondering)
+        return;
+    if (time_for_move == -1)
+        return;
+
+    if ((get_time_ms() - start_time) > time_for_move)
+    {
+        times_up = 1;
+    }
+}
+
+// Initialize LMR table
+void init_lmr_table()
+{
+    for (int depth = 1; depth < MAX_PLY; depth++)
+    {
+        for (int moves = 1; moves < 64; moves++)
+        {
+            lmr_table[depth][moves] = 0.75 + log(depth) * log(moves) / 2.25;
+        }
+    }
+}

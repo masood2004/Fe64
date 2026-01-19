@@ -11,10 +11,9 @@ engine:
   uci_options:
     Hash: 256
     Ponder: true # Enable pondering for stronger play
-    Book: true # Use opening book
-    BookVariety: 1 # Weighted random book selection
+    OwnBook: true # Use opening book
+    BookFile: "book.bin" # Main opening book
     Contempt: 24 # Prefer winning over drawing
-    BoaAggression: 50 # Balanced Boa Constrictor style
 
 matchmaking:
   allow_matchmaking: true
