@@ -19,32 +19,32 @@ extern int nnue_weights_loaded();
 // ============================================ \\
 
 // Mobility bonuses
-const int mobility_bonus[5] = {0, 4, 3, 2, 1};
+const int mobility_bonus[5] = {0, 5, 4, 3, 1};
 
 // King attack weights
-const int king_attack_weights[5] = {0, 20, 20, 40, 80};
+const int king_attack_weights[5] = {0, 25, 25, 50, 100};
 
 // Pawn structure
-const int doubled_pawn_penalty = 10;
-const int isolated_pawn_penalty = 20;
-const int rook_open_file_bonus = 25;
-const int rook_semi_open_bonus = 15;
-const int bishop_pair_bonus = 50;
+const int doubled_pawn_penalty = 12;
+const int isolated_pawn_penalty = 22;
+const int rook_open_file_bonus = 30;
+const int rook_semi_open_bonus = 18;
+const int bishop_pair_bonus = 55;
 
 // Boa Constrictor style
-const int space_bonus_mg = 2;
+const int space_bonus_mg = 3;
 const int space_bonus_eg = 1;
-const int restricted_piece_penalty = 8;
-const int pawn_chain_bonus = 10;
-const int knight_outpost_bonus = 25;
-const int bishop_outpost_bonus = 15;
-const int king_tropism_bonus = 3;
-const int trade_bonus_per_100cp = 5;
-const int blockade_bonus = 20;
-const int seventh_rank_rook_bonus = 30;
-const int connected_rooks_bonus = 15;
-const int pawn_shelter_bonus = 10;
-const int pawn_storm_bonus = 5;
+const int restricted_piece_penalty = 10;
+const int pawn_chain_bonus = 12;
+const int knight_outpost_bonus = 30;
+const int bishop_outpost_bonus = 18;
+const int king_tropism_bonus = 4;
+const int trade_bonus_per_100cp = 6;
+const int blockade_bonus = 25;
+const int seventh_rank_rook_bonus = 35;
+const int connected_rooks_bonus = 18;
+const int pawn_shelter_bonus = 12;
+const int pawn_storm_bonus = 6;
 
 // Mop-up evaluation
 const int center_manhattan_distance[64] = {
@@ -330,20 +330,121 @@ int calculate_king_tropism(int color)
 int count_king_attackers(int king_square, int attacking_side)
 {
     int attackers = 0;
+    int attack_weight = 0;
+
+    // Check the king zone (king square + adjacent squares)
+    U64 king_zone = king_attacks[king_square] | (1ULL << king_square);
 
     if (attacking_side == white)
     {
-        attackers += count_bits(knight_attacks[king_square] & bitboards[N]);
-        attackers += count_bits(get_bishop_attacks_magic(king_square, occupancies[both]) & (bitboards[B] | bitboards[Q]));
-        attackers += count_bits(get_rook_attacks_magic(king_square, occupancies[both]) & (bitboards[R] | bitboards[Q]));
+        // Knight attacks on king zone
+        U64 knights = bitboards[N];
+        while (knights)
+        {
+            int sq = get_ls1b_index(knights);
+            if (knight_attacks[sq] & king_zone)
+            {
+                attackers++;
+                attack_weight += 25;
+            }
+            pop_bit(knights, sq);
+        }
+
+        // Bishop attacks on king zone
+        U64 bishops = bitboards[B];
+        while (bishops)
+        {
+            int sq = get_ls1b_index(bishops);
+            if (get_bishop_attacks_magic(sq, occupancies[both]) & king_zone)
+            {
+                attackers++;
+                attack_weight += 25;
+            }
+            pop_bit(bishops, sq);
+        }
+
+        // Rook attacks on king zone
+        U64 rooks = bitboards[R];
+        while (rooks)
+        {
+            int sq = get_ls1b_index(rooks);
+            if (get_rook_attacks_magic(sq, occupancies[both]) & king_zone)
+            {
+                attackers++;
+                attack_weight += 50;
+            }
+            pop_bit(rooks, sq);
+        }
+
+        // Queen attacks on king zone
+        U64 queens = bitboards[Q];
+        while (queens)
+        {
+            int sq = get_ls1b_index(queens);
+            if (get_queen_attacks(sq, occupancies[both]) & king_zone)
+            {
+                attackers++;
+                attack_weight += 100;
+            }
+            pop_bit(queens, sq);
+        }
     }
     else
     {
-        attackers += count_bits(knight_attacks[king_square] & bitboards[n]);
-        attackers += count_bits(get_bishop_attacks_magic(king_square, occupancies[both]) & (bitboards[b] | bitboards[q]));
-        attackers += count_bits(get_rook_attacks_magic(king_square, occupancies[both]) & (bitboards[r] | bitboards[q]));
+        U64 knights = bitboards[n];
+        while (knights)
+        {
+            int sq = get_ls1b_index(knights);
+            if (knight_attacks[sq] & king_zone)
+            {
+                attackers++;
+                attack_weight += 25;
+            }
+            pop_bit(knights, sq);
+        }
+
+        U64 bishops = bitboards[b];
+        while (bishops)
+        {
+            int sq = get_ls1b_index(bishops);
+            if (get_bishop_attacks_magic(sq, occupancies[both]) & king_zone)
+            {
+                attackers++;
+                attack_weight += 25;
+            }
+            pop_bit(bishops, sq);
+        }
+
+        U64 rooks = bitboards[r];
+        while (rooks)
+        {
+            int sq = get_ls1b_index(rooks);
+            if (get_rook_attacks_magic(sq, occupancies[both]) & king_zone)
+            {
+                attackers++;
+                attack_weight += 50;
+            }
+            pop_bit(rooks, sq);
+        }
+
+        U64 queens = bitboards[q];
+        while (queens)
+        {
+            int sq = get_ls1b_index(queens);
+            if (get_queen_attacks(sq, occupancies[both]) & king_zone)
+            {
+                attackers++;
+                attack_weight += 100;
+            }
+            pop_bit(queens, sq);
+        }
     }
-    return attackers;
+
+    // Quadratic scaling for multiple attackers (very important for king safety)
+    if (attackers >= 2)
+        attack_weight = attack_weight * attackers / 2;
+
+    return attack_weight;
 }
 
 int is_passed_pawn(int square, int color)
@@ -418,11 +519,12 @@ int evaluate()
     int white_king_sq = get_ls1b_index(bitboards[K]);
     int black_king_sq = get_ls1b_index(bitboards[k]);
 
-    // King attackers
-    int white_king_attackers = count_king_attackers(black_king_sq, white);
-    int black_king_attackers = count_king_attackers(white_king_sq, black);
-    score += white_king_attackers * 15;
-    score -= black_king_attackers * 15;
+    // King safety (attack weight based)
+    int white_king_attack = count_king_attackers(black_king_sq, white);
+    int black_king_attack = count_king_attackers(white_king_sq, black);
+    // Scale attack by game phase (more important in middlegame)
+    score += white_king_attack * phase_score / 256;
+    score -= black_king_attack * phase_score / 256;
 
     // Boa Constrictor evaluation
     int white_space = calculate_space(white);
@@ -469,12 +571,59 @@ int evaluate()
             {
             case P:
                 score += pawn_score[square];
+                {
+                    int file = square % 8;
+                    int rank = square / 8;
+                    U64 file_mask = 0x0101010101010101ULL << file;
+
+                    // Doubled pawn penalty
+                    if (count_bits(file_mask & bitboards[P]) > 1)
+                        score -= doubled_pawn_penalty;
+
+                    // Isolated pawn penalty
+                    U64 adjacent_files = 0ULL;
+                    if (file > 0)
+                        adjacent_files |= 0x0101010101010101ULL << (file - 1);
+                    if (file < 7)
+                        adjacent_files |= 0x0101010101010101ULL << (file + 1);
+                    if (!(adjacent_files & bitboards[P]))
+                        score -= isolated_pawn_penalty;
+
+                    // Backward pawn penalty
+                    int is_backward = 0;
+                    if (rank > 1)
+                    {
+                        U64 support_mask = 0ULL;
+                        if (file > 0)
+                            support_mask |= (1ULL << ((rank + 1) * 8 + file - 1));
+                        if (file < 7)
+                            support_mask |= (1ULL << ((rank + 1) * 8 + file + 1));
+                        U64 stop_sq = 1ULL << ((rank - 1) * 8 + file);
+                        if (!(support_mask & bitboards[P]) && (pawn_attacks[white][(rank - 1) * 8 + file] & bitboards[p]))
+                            is_backward = 1;
+                    }
+                    if (is_backward)
+                        score -= 15;
+                }
                 if (is_passed_pawn(square, white))
                 {
+                    int rank = square / 8;
                     if (phase_score <= 128)
-                        score += passed_pawn_bonus_eg[square / 8];
+                    {
+                        score += passed_pawn_bonus_eg[rank];
+                        // King proximity bonus for passed pawns in endgame
+                        int pawn_promote_sq = square % 8; // a1..h1 for white
+                        int dist_own_king = square_distance(white_king_sq, square);
+                        int dist_enemy_king = square_distance(black_king_sq, square);
+                        score += (dist_enemy_king - dist_own_king) * 8;
+                    }
                     else
-                        score += passed_pawn_bonus[square / 8];
+                    {
+                        score += passed_pawn_bonus[rank];
+                    }
+                    // Protected passed pawn bonus
+                    if (pawn_attacks[black][square] & bitboards[P])
+                        score += 15;
                 }
                 break;
             case N:
@@ -501,6 +650,10 @@ int evaluate()
                         score += rook_semi_open_bonus;
                     if (rank == 1)
                         score += seventh_rank_rook_bonus;
+                    // Connected rooks bonus
+                    U64 rook_ray = get_rook_attacks_magic(square, occupancies[both]);
+                    if (rook_ray & bitboards[R] & ~(1ULL << square))
+                        score += connected_rooks_bonus;
                 }
                 score += count_bits(get_rook_attacks_magic(square, occupancies[both]) & ~occupancies[white]) * 2;
                 break;
@@ -519,12 +672,58 @@ int evaluate()
                 break;
             case p:
                 score -= pawn_score[square ^ 56];
+                {
+                    int file = square % 8;
+                    int rank = square / 8;
+                    U64 file_mask = 0x0101010101010101ULL << file;
+
+                    // Doubled pawn penalty
+                    if (count_bits(file_mask & bitboards[p]) > 1)
+                        score += doubled_pawn_penalty;
+
+                    // Isolated pawn penalty
+                    U64 adjacent_files = 0ULL;
+                    if (file > 0)
+                        adjacent_files |= 0x0101010101010101ULL << (file - 1);
+                    if (file < 7)
+                        adjacent_files |= 0x0101010101010101ULL << (file + 1);
+                    if (!(adjacent_files & bitboards[p]))
+                        score += isolated_pawn_penalty;
+
+                    // Backward pawn penalty
+                    int is_backward = 0;
+                    if (rank < 6)
+                    {
+                        U64 support_mask = 0ULL;
+                        if (file > 0)
+                            support_mask |= (1ULL << ((rank - 1) * 8 + file - 1));
+                        if (file < 7)
+                            support_mask |= (1ULL << ((rank - 1) * 8 + file + 1));
+                        U64 stop_sq = 1ULL << ((rank + 1) * 8 + file);
+                        if (!(support_mask & bitboards[p]) && (pawn_attacks[black][(rank + 1) * 8 + file] & bitboards[P]))
+                            is_backward = 1;
+                    }
+                    if (is_backward)
+                        score += 15;
+                }
                 if (is_passed_pawn(square, black))
                 {
+                    int rank = square / 8;
                     if (phase_score <= 128)
-                        score -= passed_pawn_bonus_eg[7 - (square / 8)];
+                    {
+                        score -= passed_pawn_bonus_eg[7 - rank];
+                        // King proximity bonus for passed pawns in endgame
+                        int dist_own_king = square_distance(black_king_sq, square);
+                        int dist_enemy_king = square_distance(white_king_sq, square);
+                        score -= (dist_enemy_king - dist_own_king) * 8;
+                    }
                     else
-                        score -= passed_pawn_bonus[7 - (square / 8)];
+                    {
+                        score -= passed_pawn_bonus[7 - rank];
+                    }
+                    // Protected passed pawn bonus
+                    if (pawn_attacks[white][square] & bitboards[p])
+                        score -= 15;
                 }
                 break;
             case n:
@@ -551,6 +750,10 @@ int evaluate()
                         score -= rook_semi_open_bonus;
                     if (rank == 6)
                         score -= seventh_rank_rook_bonus;
+                    // Connected rooks bonus
+                    U64 rook_ray = get_rook_attacks_magic(square, occupancies[both]);
+                    if (rook_ray & bitboards[r] & ~(1ULL << square))
+                        score -= connected_rooks_bonus;
                 }
                 score -= count_bits(get_rook_attacks_magic(square, occupancies[both]) & ~occupancies[black]) * 2;
                 break;

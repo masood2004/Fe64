@@ -15,6 +15,7 @@ extern void init_hash_keys();
 extern void init_lmr_table();
 extern U64 generate_hash_key();
 extern void clear_tt();
+extern void init_tt(int mb);
 
 // External function declarations - Opening Book
 extern int load_opening_book(const char *filename);
@@ -48,7 +49,7 @@ int main(int argc, char *argv[])
     init_lmr_table(); // Initialize Late Move Reduction table
 
     hash_key = generate_hash_key();
-    clear_tt();
+    init_tt(hash_size_mb); // Initialize TT with configured hash size
 
     // Clear search tables
     memset(killer_moves, 0, sizeof(killer_moves));

@@ -21,6 +21,7 @@ extern void communicate();
 extern int read_tt(int alpha, int beta, int depth, int ply);
 extern void write_tt(int depth, int score, int flag, int best_move, int ply);
 extern int get_tt_move();
+extern int get_tt_score_raw(int ply, int *tt_depth_out, int *tt_flags_out);
 extern int is_repetition();
 
 // MVV-LVA (Most Valuable Victim - Least Valuable Attacker) scores
@@ -139,11 +140,13 @@ int see(int move)
     int victim_value = 0;
     if (get_move_capture(move))
     {
-        for (int p = (side == white) ? p : P; p <= ((side == white) ? k : K); p++)
+        int start_piece = (side == white) ? p : P;
+        int end_piece = (side == white) ? k : K;
+        for (int pp = start_piece; pp <= end_piece; pp++)
         {
-            if (get_bit(bitboards[p], to))
+            if (get_bit(bitboards[pp], to))
             {
-                switch (p % 6)
+                switch (pp % 6)
                 {
                 case 0:
                     victim_value = see_piece_values[0];
@@ -226,32 +229,36 @@ int see_ge(int move, int threshold)
 
     // Get victim value
     int victim_value = 0;
-    for (int p = (side == white) ? p : P; p <= ((side == white) ? k : K); p++)
     {
-        if (get_bit(bitboards[p], to))
+        int start_piece = (side == white) ? p : P;
+        int end_piece = (side == white) ? k : K;
+        for (int pp = start_piece; pp <= end_piece; pp++)
         {
-            switch (p % 6)
+            if (get_bit(bitboards[pp], to))
             {
-            case 0:
-                victim_value = see_piece_values[0];
-                break;
-            case 1:
-                victim_value = see_piece_values[1];
-                break;
-            case 2:
-                victim_value = see_piece_values[2];
-                break;
-            case 3:
-                victim_value = see_piece_values[3];
-                break;
-            case 4:
-                victim_value = see_piece_values[4];
-                break;
-            case 5:
-                victim_value = see_piece_values[5];
+                switch (pp % 6)
+                {
+                case 0:
+                    victim_value = see_piece_values[0];
+                    break;
+                case 1:
+                    victim_value = see_piece_values[1];
+                    break;
+                case 2:
+                    victim_value = see_piece_values[2];
+                    break;
+                case 3:
+                    victim_value = see_piece_values[3];
+                    break;
+                case 4:
+                    victim_value = see_piece_values[4];
+                    break;
+                case 5:
+                    victim_value = see_piece_values[5];
+                    break;
+                }
                 break;
             }
-            break;
         }
     }
 
@@ -470,12 +477,35 @@ int negamax(int alpha, int beta, int depth, int ply)
     if (ply > 0 && is_repetition())
         return 0;
 
-    // Check TT
-    int tt_score = read_tt(alpha, beta, depth, ply);
-    int pv_move = get_tt_move();
+    // Mate distance pruning - if we already found a mate closer to root
+    if (ply > 0)
+    {
+        int r_alpha = alpha > -MATE + ply ? alpha : -MATE + ply;
+        int r_beta = beta < MATE - ply - 1 ? beta : MATE - ply - 1;
+        if (r_alpha >= r_beta)
+            return r_alpha;
+    }
 
-    if (ply && tt_score != -INF - 1)
-        return tt_score;
+    // Check TT (skip if we have an excluded move for singular extension search)
+    int tt_score = -INF - 1;
+    int pv_move = 0;
+    int tt_depth = 0;
+    int tt_flags = 0;
+    int raw_tt_score = -INF - 1;
+
+    if (!excluded_move[ply])
+    {
+        tt_score = read_tt(alpha, beta, depth, ply);
+        pv_move = get_tt_move();
+        raw_tt_score = get_tt_score_raw(ply, &tt_depth, &tt_flags);
+
+        if (tt_score != -INF - 1 && ply)
+            return tt_score;
+    }
+    else
+    {
+        pv_move = get_tt_move(); // Still get TT move for ordering
+    }
 
     // Base case: quiescence
     if (depth <= 0)
@@ -497,10 +527,17 @@ int negamax(int alpha, int beta, int depth, int ply)
     if (in_check && depth < MAX_PLY / 2)
         depth++;
 
-    // Null move pruning
+    // Static evaluation for pruning decisions
+    int static_eval = evaluate();
+    static_eval_stack[ply] = static_eval;
+
+    // Improving flag - position is getting better compared to 2 plies ago
+    int improving = (ply >= 2 && static_eval > static_eval_stack[ply - 2]);
+
+    // Null move pruning (with verification)
     int non_pawn_material = (side == white) ? (count_bits(bitboards[N]) + count_bits(bitboards[B]) + count_bits(bitboards[R]) + count_bits(bitboards[Q])) : (count_bits(bitboards[n]) + count_bits(bitboards[b]) + count_bits(bitboards[r]) + count_bits(bitboards[q]));
 
-    if (depth >= 3 && !in_check && ply > 0 && non_pawn_material > 0)
+    if (depth >= 3 && !in_check && ply > 0 && non_pawn_material > 1)
     {
         copy_board();
 
@@ -517,7 +554,8 @@ int negamax(int alpha, int beta, int depth, int ply)
             en_passant = no_sq;
         }
 
-        int R = 3 + depth / 6;
+        // Adaptive null move reduction
+        int R = 3 + depth / 3 + (depth > 6 ? 1 : 0);
         if (R > depth - 1)
             R = depth - 1;
 
@@ -529,15 +567,19 @@ int negamax(int alpha, int beta, int depth, int ply)
         if (times_up)
             return 0;
         if (score >= beta)
-            return beta;
+        {
+            // Don't return unproven mate scores
+            if (score >= MATE - 100)
+                score = beta;
+            return score;
+        }
     }
 
     // Razoring
     if (depth <= 3 && !in_check && ply > 0)
     {
         int razor_margin = 300 + 60 * depth;
-        int eval = evaluate();
-        if (eval + razor_margin < alpha)
+        if (static_eval + razor_margin < alpha)
         {
             int razor_score = quiescence(alpha - razor_margin, beta - razor_margin);
             if (razor_score + razor_margin <= alpha)
@@ -545,17 +587,88 @@ int negamax(int alpha, int beta, int depth, int ply)
         }
     }
 
-    // Reverse futility pruning
-    if (depth <= 6 && !in_check && ply > 0)
+    // Probcut - if a shallow search at a higher beta finds a cutoff,
+    // the full depth search likely will too
+    if (depth >= 5 && !pv_node && !in_check && ply > 0 &&
+        abs(beta) < MATE - 100)
     {
-        int eval = evaluate();
-        int futility_margin = 80 * depth;
-        if (eval - futility_margin >= beta)
-            return eval - futility_margin;
+        int probcut_beta = beta + probcut_margin;
+        int probcut_depth = depth - 4;
+        if (probcut_depth < 1)
+            probcut_depth = 1;
+
+        moves probcut_moves[1];
+        generate_moves(probcut_moves);
+
+        // Score and sort for probcut (only try captures and good moves)
+        int pc_scores[256];
+        for (int i = 0; i < probcut_moves->count; i++)
+            pc_scores[i] = score_move(probcut_moves->moves[i], pv_move, ply);
+
+        for (int i = 0; i < probcut_moves->count; i++)
+        {
+            // Selection sort
+            int best_idx = i;
+            for (int j = i + 1; j < probcut_moves->count; j++)
+                if (pc_scores[j] > pc_scores[best_idx])
+                    best_idx = j;
+            if (best_idx != i)
+            {
+                int tmp = probcut_moves->moves[i];
+                probcut_moves->moves[i] = probcut_moves->moves[best_idx];
+                probcut_moves->moves[best_idx] = tmp;
+                int ts = pc_scores[i];
+                pc_scores[i] = pc_scores[best_idx];
+                pc_scores[best_idx] = ts;
+            }
+
+            // Only try captures for probcut
+            if (!get_move_capture(probcut_moves->moves[i]))
+                continue;
+
+            // Skip bad captures
+            if (!see_ge(probcut_moves->moves[i], 0))
+                continue;
+
+            copy_board();
+            int old_rep = repetition_index;
+            if (!make_move(probcut_moves->moves[i], all_moves))
+                continue;
+            repetition_index++;
+            repetition_table[repetition_index] = hash_key;
+
+            // Do a shallow verification search
+            int pc_score = -negamax(-probcut_beta, -probcut_beta + 1, probcut_depth, ply + 1);
+
+            repetition_index = old_rep;
+            take_back();
+
+            if (times_up)
+                return 0;
+
+            if (pc_score >= probcut_beta)
+                return pc_score;
+        }
+    }
+
+    // Reverse futility pruning
+    if (depth <= 6 && !in_check && ply > 0 && !pv_node)
+    {
+        int futility_margin = (improving ? 70 : 80) * depth;
+        if (static_eval - futility_margin >= beta)
+            return static_eval - futility_margin;
     }
 
     moves move_list[1];
     generate_moves(move_list);
+
+    // Internal Iterative Deepening (IID)
+    if (depth >= 5 && !pv_move && !in_check)
+    {
+        int iid_score = negamax(alpha, beta, depth - 3, ply);
+        if (!times_up)
+            pv_move = get_tt_move();
+    }
 
     // Score moves
     int scores[256];
@@ -591,6 +704,10 @@ int negamax(int alpha, int beta, int depth, int ply)
             scores[best_idx] = temp_score;
         }
 
+        // Skip excluded move (for singular extension search)
+        if (move_list->moves[count] == excluded_move[ply])
+            continue;
+
         copy_board();
 
         int old_rep_index = repetition_index;
@@ -614,7 +731,7 @@ int negamax(int alpha, int beta, int depth, int ply)
 
         // Late move pruning
         if (depth <= 7 && !pv_node && !in_check && !gives_check && is_quiet &&
-            moves_searched > lmp_margins[depth < 8 ? depth : 7])
+            moves_searched > lmp_margins[depth < 8 ? depth : 7] + (improving ? 3 : 0))
         {
             repetition_index = old_rep_index;
             take_back();
@@ -624,8 +741,20 @@ int negamax(int alpha, int beta, int depth, int ply)
         // Futility pruning at move level
         if (depth <= 6 && !pv_node && !in_check && !gives_check && is_quiet && moves_searched > 1)
         {
-            int static_eval = evaluate();
             if (static_eval + futility_margins[depth] <= alpha)
+            {
+                repetition_index = old_rep_index;
+                take_back();
+                continue;
+            }
+        }
+
+        // History pruning - prune quiet moves with very negative history
+        if (depth <= 4 && !pv_node && !in_check && is_quiet && moves_searched > 1)
+        {
+            int hist = history_moves[get_move_piece(move_list->moves[count])][get_move_target(move_list->moves[count])];
+            int hist_threshold = -1024 * depth;
+            if (hist < hist_threshold)
             {
                 repetition_index = old_rep_index;
                 take_back();
@@ -641,13 +770,48 @@ int negamax(int alpha, int beta, int depth, int ply)
             continue;
         }
 
+        // SEE pruning for quiet moves at low depths
+        if (depth <= 6 && !pv_node && is_quiet && moves_searched > 3 &&
+            !see_ge(move_list->moves[count], -20 * depth))
+        {
+            repetition_index = old_rep_index;
+            take_back();
+            continue;
+        }
+
         // Extensions
         int extension = 0;
         if (gives_check)
             extension = 1;
 
+        // Singular extensions - if TT move appears much better than alternatives
+        if (depth >= 8 && move_list->moves[count] == pv_move && pv_move &&
+            !excluded_move[ply] && !in_check &&
+            raw_tt_score != -INF - 1 && tt_depth >= depth - 3 &&
+            (tt_flags == HASH_EXACT || tt_flags == HASH_BETA))
+        {
+            int se_beta = raw_tt_score - 2 * depth;
+            int se_depth = (depth - 1) / 2;
+
+            // Search all moves except the TT move at reduced depth
+            excluded_move[ply] = pv_move;
+            int se_score = negamax(se_beta - 1, se_beta, se_depth, ply);
+            excluded_move[ply] = 0;
+
+            if (!times_up && se_score < se_beta)
+            {
+                // TT move is singular - extend it
+                extension = 1;
+            }
+            else if (!times_up && se_score >= beta)
+            {
+                // Multi-cut: even without TT move, we exceed beta
+                return se_score;
+            }
+        }
+
         // Passed pawn extension
-        if (get_move_piece(move_list->moves[count]) == P || get_move_piece(move_list->moves[count]) == p)
+        if (extension == 0 && (get_move_piece(move_list->moves[count]) == P || get_move_piece(move_list->moves[count]) == p))
         {
             int target = get_move_target(move_list->moves[count]);
             int rank = target / 8;
@@ -668,13 +832,16 @@ int negamax(int alpha, int beta, int depth, int ply)
             {
                 reduction = lmr_table[depth < MAX_PLY ? depth : MAX_PLY - 1][moves_searched < 64 ? moves_searched : 63];
 
+                // Reduce less for PV nodes
                 if (pv_node)
                     reduction--;
 
+                // Reduce less for killer moves
                 if (move_list->moves[count] == killer_moves[0][ply] ||
                     move_list->moves[count] == killer_moves[1][ply])
                     reduction--;
 
+                // Reduce less for counter moves
                 if (ply > 0 && last_move_made[ply - 1])
                 {
                     int lm = last_move_made[ply - 1];
@@ -682,19 +849,41 @@ int negamax(int alpha, int beta, int depth, int ply)
                         reduction--;
                 }
 
+                // History-based LMR adjustments
                 int hist = history_moves[get_move_piece(move_list->moves[count])][get_move_target(move_list->moves[count])];
-                if (hist > 1000)
-                    reduction--;
-                else if (hist < -1000)
+                reduction -= hist / 5000; // Good history reduces less, bad history increases
+
+                // Increase reduction for non-PV nodes at higher depths
+                if (!pv_node && depth > 8)
                     reduction++;
 
-                if (!pv_node && depth > 8)
+                // More aggressive at very high move counts
+                if (moves_searched > 12)
+                    reduction++;
+
+                // Reduce less when improving
+                if (improving)
+                    reduction--;
+
+                // Increase reduction for positions with many pieces (complex middlegame)
+                if (!pv_node && non_pawn_material > 4)
+                    reduction++;
+
+                // Reduce by 1 for captures in LMR (they have their own ordering)
+                if (is_capture && !pv_node)
                     reduction++;
 
                 if (reduction > depth - 2)
                     reduction = depth - 2;
                 if (reduction < 0)
                     reduction = 0;
+            }
+            // LMR for captures too (less aggressively)
+            else if (moves_searched >= 5 && depth >= 5 && !in_check && is_capture && !pv_node)
+            {
+                int see_val = see(move_list->moves[count]);
+                if (see_val < 0)
+                    reduction = 1 + (depth > 8 ? 1 : 0);
             }
 
             score = -negamax(-alpha - 1, -alpha, depth - 1 - reduction + extension, ply + 1);

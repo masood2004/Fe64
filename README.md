@@ -14,7 +14,7 @@
 ### "The Boa Constrictor" - Slow Death Style
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-4.0.0-blue.svg)](https://github.com/yourusername/fe64)
+[![Version](https://img.shields.io/badge/version-4.2.0-blue.svg)](https://github.com/yourusername/fe64)
 [![ELO](https://img.shields.io/badge/estimated_ELO-4000+-green.svg)]()
 
 _A powerful UCI-compliant chess engine that employs strategic positional play_
@@ -72,14 +72,16 @@ The name reflects the engine's approach: like iron slowly rusting and constricti
   - Principal Variation Search (PVS)
   - Iterative Deepening with Aspiration Windows
   - Transposition Tables (Zobrist hashing)
-  - Late Move Reductions (LMR)
-  - Null Move Pruning with verification
-  - Futility Pruning
-  - Reverse Futility Pruning (Static Null Move)
-  - Razoring
+  - Late Move Reductions (LMR) with improving detection
+  - Null Move Pruning with adaptive reduction (R = 3 + depth/3)
+  - Futility Pruning (move-level and reverse)
+  - Razoring with quiescence verification
   - SEE (Static Exchange Evaluation) pruning
-  - Singular Extensions
+  - Internal Iterative Deepening (IID)
+  - Mate Distance Pruning
+  - Late Move Pruning with improving-aware margins
   - Check Extensions
+  - Passed Pawn Extensions (7th rank)
   - Quiescence Search with Delta Pruning
 
 - **Move Ordering**
@@ -99,11 +101,12 @@ The name reflects the engine's approach: like iron slowly rusting and constricti
     - Piece mobility assessment
     - Enemy piece restriction bonuses
   - Pawn structure analysis:
-    - Passed pawns with king distance bonus
+    - Passed pawns with king distance bonus (endgame)
+    - Protected passed pawn bonus
     - Isolated pawn penalty
     - Doubled pawn penalty
+    - Backward pawn penalty
     - Pawn chains bonus
-    - Pawn duo bonus
   - King safety:
     - Pawn shield evaluation
     - Open file penalties
@@ -638,11 +641,59 @@ Average NPS: ~2,500,000 on modern hardware
 
 Contributions are welcome! Areas for improvement:
 
-1. **NNUE Integration**: Neural network evaluation
+1. **NNUE Integration**: Neural network evaluation (training infrastructure ready)
 2. **Syzygy Support**: Endgame tablebases
 3. **Multi-threading**: Lazy SMP search
 4. **SPRT Testing**: Strength regression testing
-5. **Tuning**: Parameter optimization
+5. **Tuning**: Parameter optimization via SPSA/Texel
+
+### Recent Improvements (v4.2.0)
+
+**Search Enhancements (v4.2):**
+
+- Singular Extensions: Extend the TT move by 1 ply when it's much better than alternatives
+- Multi-cut pruning: Early cutoff when even non-TT moves exceed beta
+- Aspiration Windows Loop: Exponentially-growing re-search windows
+- History Pruning: Prune quiet moves with very bad history scores
+- SEE Pruning for Quiet Moves: Skip losing quiet moves at low depths
+- LMR for Captures: Reduced search for bad captures at higher depths
+- History-based LMR: Continuous reduction adjustment based on move history
+- Score Stability Time Management: Faster exit when score is stable, extended search on score drops
+
+**Evaluation Improvements (v4.2):**
+
+- King Safety Zone: Full zone evaluation with piece-type attack weights and quadratic scaling
+- NNUE dtype fix: Corrected float64→float32 corruption in weight saving
+
+**Critical Bug Fixes (v4.1):**
+
+- Fixed hash_key not saved/restored in copy_board/take_back (broke entire TT)
+- Fixed SEE variable shadowing causing potential undefined behavior
+- Fixed pondering time management (ponder_time_for_move never set)
+
+**Search Enhancements (v4.1):**
+
+- Added Internal Iterative Deepening (IID) at depth >= 5
+- Added Mate Distance Pruning
+- Added improving detection (position getting better vs 2 plies ago)
+- Improved null move pruning: adaptive R = 3 + depth/3 + (depth > 6 ? 1 : 0)
+- Improved LMR formula: 0.5 + log(depth) \* log(moves) / 2.5
+- Improving-aware LMP, futility pruning, and LMR reductions
+- Single evaluate() call per node (reused for all pruning)
+
+**Evaluation Improvements (v4.1):**
+
+- Applied previously-unused doubled/isolated pawn penalties
+- Added backward pawn, connected rooks, protected passed pawn bonuses
+- King proximity bonus for passed pawns in endgames
+- Stockfish-inspired PSTs, tuned material values (N=337, B=365, R=477, Q=1025)
+
+**Opening Books & NNUE:**
+
+- Integrated gm2600.bin (1.5MB GM-level opening book)
+- Built custom_book.bin (75,154 entries from 10,604 GM games)
+- NNUE training with Stockfish 14.1 depth-12 evaluations
+- Architecture: 768→256→32→1 with CReLU, scale 400
 
 ### Development Setup
 

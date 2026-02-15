@@ -38,7 +38,9 @@ U64 repetition_table[MAX_GAME_MOVES];
 int repetition_index = 0;
 
 // Transposition Table
-tt_entry transposition_table[TT_SIZE];
+tt_entry *transposition_table = NULL;
+U64 tt_num_entries = 0;
+int tt_generation = 0;
 
 // Search State
 int best_move;
@@ -52,6 +54,8 @@ int butterfly_history[2][64][64];
 int capture_history[12][64][6];
 int last_move_made[MAX_PLY];
 int lmr_table[MAX_PLY][64];
+int static_eval_stack[MAX_PLY];
+int excluded_move[MAX_PLY];
 
 // Timing
 long long start_time;
@@ -73,6 +77,7 @@ int multi_pv = 1;
 int use_nnue_eval = 0;
 int contempt = 10;
 int use_book = 1;
+int probcut_margin = 200;
 
 // Constants
 char *start_position = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -89,82 +94,82 @@ const int castling_rights[64] = {
     13, 15, 15, 15, 12, 15, 15, 14};
 
 const int see_piece_values[12] = {
-    100, 320, 330, 500, 900, 20000,
-    100, 320, 330, 500, 900, 20000};
+    100, 337, 365, 477, 1025, 20000,
+    100, 337, 365, 477, 1025, 20000};
 
-const int lmp_margins[8] = {0, 5, 8, 12, 18, 25, 33, 42};
-const int futility_margins[7] = {0, 100, 160, 220, 280, 340, 400};
-const int razor_margins[4] = {0, 125, 250, 375};
-const int rfp_margins[7] = {0, 70, 140, 210, 280, 350, 420};
-const int history_max = 16384;
+const int lmp_margins[8] = {0, 6, 10, 15, 22, 30, 40, 52};
+const int futility_margins[7] = {0, 120, 180, 240, 300, 360, 420};
+const int razor_margins[4] = {0, 150, 300, 450};
+const int rfp_margins[7] = {0, 80, 160, 240, 320, 400, 480};
+const int history_max = 32768;
 
-// Piece-Square Tables
+// Piece-Square Tables (tuned for strong play - Stockfish-inspired values)
 const int pawn_score[64] = {
-    90, 90, 90, 90, 90, 90, 90, 90,
-    30, 30, 30, 40, 40, 30, 30, 30,
-    20, 20, 20, 30, 30, 20, 20, 20,
-    10, 10, 10, 20, 20, 10, 10, 10,
-    5, 5, 10, 20, 20, 5, 5, 5,
-    0, 0, 0, 5, 5, 0, 0, 0,
-    0, 0, 0, -10, -10, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    98, 134, 61, 95, 68, 126, 34, -11,
+    -6, 7, 26, 31, 65, 56, 25, -20,
+    -14, 13, 6, 21, 23, 12, 17, -23,
+    -27, -2, -5, 12, 17, 6, 10, -25,
+    -26, -4, -4, -10, 3, 3, 33, -12,
+    -35, -1, -20, -23, -15, 24, 38, -22,
     0, 0, 0, 0, 0, 0, 0, 0};
 
 const int knight_score[64] = {
-    -50, -40, -30, -30, -30, -30, -40, -50,
-    -40, -20, 0, 0, 0, 0, -20, -40,
-    -30, 0, 10, 15, 15, 10, 0, -30,
-    -30, 5, 15, 20, 20, 15, 5, -30,
-    -30, 0, 15, 20, 20, 15, 0, -30,
-    -30, 5, 10, 15, 15, 10, 5, -30,
-    -40, -20, 0, 5, 5, 0, -20, -40,
-    -50, -40, -30, -30, -30, -30, -40, -50};
+    -167, -89, -34, -49, 61, -97, -15, -107,
+    -73, -41, 72, 36, 23, 62, 7, -17,
+    -47, 60, 37, 65, 84, 129, 73, 44,
+    -9, 17, 19, 53, 37, 69, 18, 22,
+    -13, 4, 16, 13, 28, 19, 21, -8,
+    -23, -9, 12, 10, 19, 17, 25, -16,
+    -29, -53, -12, -3, -1, 18, -14, -19,
+    -105, -21, -58, -33, -17, -28, -19, -23};
 
 const int bishop_score[64] = {
-    -20, -10, -10, -10, -10, -10, -10, -20,
-    -10, 0, 0, 0, 0, 0, 0, -10,
-    -10, 0, 5, 10, 10, 5, 0, -10,
-    -10, 5, 5, 10, 10, 5, 5, -10,
-    -10, 0, 10, 10, 10, 10, 0, -10,
-    -10, 10, 10, 10, 10, 10, 10, -10,
-    -10, 5, 0, 0, 0, 0, 5, -10,
-    -20, -10, -10, -10, -10, -10, -10, -20};
+    -29, 4, -82, -37, -25, -42, 7, -8,
+    -26, 16, -18, -13, 30, 59, 18, -47,
+    -16, 37, 43, 40, 35, 50, 37, -2,
+    -4, 5, 19, 50, 37, 37, 7, -2,
+    -6, 13, 13, 26, 34, 12, 10, 4,
+    0, 15, 15, 15, 14, 27, 18, 10,
+    4, 15, 16, 0, 7, 21, 33, 1,
+    -33, -3, -14, -21, -13, -12, -39, -21};
 
 const int rook_score[64] = {
-    0, 0, 0, 0, 0, 0, 0, 0,
-    5, 10, 10, 10, 10, 10, 10, 5,
-    -5, 0, 0, 0, 0, 0, 0, -5,
-    -5, 0, 0, 0, 0, 0, 0, -5,
-    -5, 0, 0, 0, 0, 0, 0, -5,
-    -5, 0, 0, 0, 0, 0, 0, -5,
-    -5, 0, 0, 0, 0, 0, 0, -5,
-    0, 0, 0, 5, 5, 0, 0, 0};
+    32, 42, 32, 51, 63, 9, 31, 43,
+    27, 32, 58, 62, 80, 67, 26, 44,
+    -5, 19, 26, 36, 17, 45, 61, 16,
+    -24, -11, 7, 26, 24, 35, -8, -20,
+    -36, -26, -12, -1, 9, -7, 6, -23,
+    -45, -25, -16, -17, 3, 0, -5, -33,
+    -44, -16, -20, -9, -1, 11, -6, -71,
+    -19, -13, 1, 17, 16, 7, -37, -26};
 
 const int king_score[64] = {
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -20, -30, -30, -40, -40, -30, -30, -20,
-    -10, -20, -20, -20, -20, -20, -20, -10,
-    20, 20, 0, 0, 0, 0, 20, 20,
-    20, 30, 10, 0, 0, 10, 30, 20};
+    -65, 23, 16, -15, -56, -34, 2, 13,
+    29, -1, -20, -7, -8, -4, -38, -29,
+    -9, 24, 2, -16, -20, 6, 22, -22,
+    -17, -20, -12, -27, -30, -25, -14, -36,
+    -49, -1, -27, -39, -46, -44, -33, -51,
+    -14, -14, -22, -46, -44, -30, -15, -27,
+    1, 7, -8, -64, -43, -16, 9, 8,
+    -15, 36, 12, -54, 8, -28, 24, 14};
 
 const int king_endgame_score[64] = {
-    -50, -40, -30, -20, -20, -30, -40, -50,
-    -30, -20, -10, 0, 0, -10, -20, -30,
-    -30, -10, 20, 30, 30, 20, -10, -30,
-    -30, -10, 30, 40, 40, 30, -10, -30,
-    -30, -10, 30, 40, 40, 30, -10, -30,
-    -30, -10, 20, 30, 30, 20, -10, -30,
-    -30, -30, 0, 0, 0, 0, -30, -30,
-    -50, -30, -30, -30, -30, -30, -30, -50};
+    -74, -35, -18, -18, -11, 15, 4, -17,
+    -12, 17, 14, 17, 17, 38, 23, 11,
+    10, 17, 23, 15, 20, 45, 44, 13,
+    -8, 22, 24, 27, 26, 33, 26, 3,
+    -18, -4, 21, 24, 27, 23, 9, -11,
+    -19, -3, 11, 21, 23, 16, 7, -9,
+    -27, -11, 4, 13, 14, 4, -5, -17,
+    -53, -34, -21, -11, -28, -14, -24, -43};
 
-const int passed_pawn_bonus[8] = {0, 120, 80, 50, 30, 15, 15, 0};
-const int passed_pawn_bonus_eg[8] = {0, 200, 150, 100, 60, 30, 15, 0};
+const int passed_pawn_bonus[8] = {0, 140, 100, 65, 40, 20, 10, 0};
+const int passed_pawn_bonus_eg[8] = {0, 250, 180, 130, 80, 40, 20, 0};
 
 int material_weights[12] = {
-    100, 320, 330, 500, 950, 20000,
-    -100, -320, -330, -500, -950, -20000};
+    100, 337, 365, 477, 1025, 20000,
+    -100, -337, -365, -477, -1025, -20000};
 
 // File masks
 const U64 not_a_file = 18374403900871474942ULL;
@@ -254,14 +259,45 @@ int is_repetition()
 //           TRANSPOSITION TABLE                \\
 // ============================================ \\
 
+void init_tt(int mb)
+{
+    if (transposition_table)
+        free(transposition_table);
+
+    U64 size_bytes = (U64)mb * 1024ULL * 1024ULL;
+    tt_num_entries = size_bytes / sizeof(tt_entry);
+    if (tt_num_entries < 1024)
+        tt_num_entries = 1024;
+
+    transposition_table = (tt_entry *)calloc(tt_num_entries, sizeof(tt_entry));
+    if (!transposition_table)
+    {
+        // Fallback to smaller size
+        tt_num_entries = TT_DEFAULT_SIZE;
+        transposition_table = (tt_entry *)calloc(tt_num_entries, sizeof(tt_entry));
+    }
+    tt_generation = 0;
+    printf("info string TT: %llu entries (%d MB)\n",
+           (unsigned long long)tt_num_entries, mb);
+}
+
+void resize_tt(int mb)
+{
+    init_tt(mb);
+}
+
 void clear_tt()
 {
-    memset(transposition_table, 0, sizeof(transposition_table));
+    if (transposition_table && tt_num_entries > 0)
+        memset(transposition_table, 0, tt_num_entries * sizeof(tt_entry));
+    tt_generation = 0;
 }
 
 int read_tt(int alpha, int beta, int depth, int ply)
 {
-    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
+    if (!transposition_table || tt_num_entries == 0)
+        return -INF - 1;
+    tt_entry *entry = &transposition_table[hash_key % tt_num_entries];
     if (entry->key == hash_key)
     {
         if (entry->depth >= depth)
@@ -284,16 +320,53 @@ int read_tt(int alpha, int beta, int depth, int ply)
 
 int get_tt_move()
 {
-    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
+    if (!transposition_table || tt_num_entries == 0)
+        return 0;
+    tt_entry *entry = &transposition_table[hash_key % tt_num_entries];
     if (entry->key == hash_key)
         return entry->best_move;
     return 0;
 }
 
+// Get raw TT score and depth for singular extension checks
+int get_tt_score_raw(int ply, int *tt_depth_out, int *tt_flags_out)
+{
+    if (!transposition_table || tt_num_entries == 0)
+    {
+        *tt_depth_out = 0;
+        *tt_flags_out = 0;
+        return -INF - 1;
+    }
+    tt_entry *entry = &transposition_table[hash_key % tt_num_entries];
+    if (entry->key == hash_key)
+    {
+        int score = entry->value;
+        if (score > MATE - 100)
+            score -= ply;
+        if (score < -MATE + 100)
+            score += ply;
+        *tt_depth_out = entry->depth;
+        *tt_flags_out = entry->flags;
+        return score;
+    }
+    *tt_depth_out = 0;
+    *tt_flags_out = 0;
+    return -INF - 1;
+}
+
 void write_tt(int depth, int value, int flags, int move, int ply)
 {
-    tt_entry *entry = &transposition_table[hash_key % TT_SIZE];
-    if (entry->key != hash_key || entry->depth <= depth)
+    if (!transposition_table || tt_num_entries == 0)
+        return;
+    tt_entry *entry = &transposition_table[hash_key % tt_num_entries];
+
+    // Replace if: empty, same position, deeper search, or older generation
+    int should_replace = (entry->key == 0) ||
+                         (entry->key == hash_key) ||
+                         (depth >= entry->depth) ||
+                         (flags == HASH_EXACT && entry->flags != HASH_EXACT);
+
+    if (should_replace)
     {
         int score_to_store = value;
         if (value > MATE - 100)
@@ -419,6 +492,7 @@ int input_waiting()
 
 // Non-blocking read of a complete line
 // Returns 1 if a complete line was read, 0 otherwise
+// Returns -1 on EOF (stdin closed)
 int read_line_nonblocking(char *output, int max_len)
 {
     // Ensure stdin is non-blocking
@@ -430,9 +504,15 @@ int read_line_nonblocking(char *output, int max_len)
     {
         ssize_t bytes_read = read(STDIN_FILENO, &c, 1);
 
-        if (bytes_read <= 0)
+        if (bytes_read == 0)
         {
-            // No more data available or error
+            // EOF - stdin closed, engine should stop
+            return -1;
+        }
+
+        if (bytes_read < 0)
+        {
+            // No more data available (EAGAIN/EWOULDBLOCK)
             break;
         }
 
@@ -479,7 +559,15 @@ void communicate()
     }
 
     char input[256];
-    if (read_line_nonblocking(input, sizeof(input)))
+    int result = read_line_nonblocking(input, sizeof(input));
+    if (result == -1)
+    {
+        // EOF - stdin closed, stop engine
+        times_up = 1;
+        stop_pondering = 1;
+        return;
+    }
+    if (result == 1)
     {
         if (strncmp(input, "stop", 4) == 0)
         {
@@ -511,19 +599,26 @@ void communicate()
         time_for_move = ponder_time_for_move;
         start_time = get_time_ms();
     }
+    else if (pondering && ponder_hit && ponder_time_for_move == -1)
+    {
+        // Ponderhit but no time saved - give ourselves a reasonable default
+        pondering = 0;
+        time_for_move = 10000; // 10 seconds fallback
+        start_time = get_time_ms();
+    }
 
     if (pondering)
         return;
 }
 
-// Initialize LMR table
+// Initialize LMR table (improved reduction formula)
 void init_lmr_table()
 {
     for (int depth = 1; depth < MAX_PLY; depth++)
     {
         for (int moves = 1; moves < 64; moves++)
         {
-            lmr_table[depth][moves] = 0.75 + log(depth) * log(moves) / 2.25;
+            lmr_table[depth][moves] = 0.5 + log(depth) * log(moves) / 2.5;
         }
     }
 }

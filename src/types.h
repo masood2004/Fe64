@@ -33,8 +33,8 @@
 // Search Constants
 #define INF 50000
 #define MATE 49000
-#define MAX_PLY 64
-#define MAX_GAME_MOVES 1024
+#define MAX_PLY 128
+#define MAX_GAME_MOVES 2048
 
 // ============================================ \\
 //              ENUMERATIONS                    \\
@@ -227,18 +227,21 @@ typedef struct
 #define copy_board()                             \
     U64 bitboards_copy[12], occupancies_copy[3]; \
     int side_copy, en_passant_copy, castle_copy; \
+    U64 hash_key_copy;                           \
     memcpy(bitboards_copy, bitboards, 96);       \
     memcpy(occupancies_copy, occupancies, 24);   \
     side_copy = side;                            \
     en_passant_copy = en_passant;                \
-    castle_copy = castle;
+    castle_copy = castle;                        \
+    hash_key_copy = hash_key;
 
 #define take_back()                            \
     memcpy(bitboards, bitboards_copy, 96);     \
     memcpy(occupancies, occupancies_copy, 24); \
     side = side_copy;                          \
     en_passant = en_passant_copy;              \
-    castle = castle_copy;
+    castle = castle_copy;                      \
+    hash_key = hash_key_copy;
 
 // ============================================ \\
 //           GLOBAL EXTERN DECLARATIONS         \\
@@ -274,8 +277,12 @@ extern U64 repetition_table[MAX_GAME_MOVES];
 extern int repetition_index;
 
 // Transposition Table
-#define TT_SIZE 0x400000
-extern tt_entry transposition_table[TT_SIZE];
+#define TT_DEFAULT_SIZE 0x400000
+extern tt_entry *transposition_table;
+extern U64 tt_num_entries;
+extern int tt_generation;
+extern void init_tt(int mb);
+extern void resize_tt(int mb);
 
 // Search State
 extern int best_move;
@@ -289,6 +296,8 @@ extern int butterfly_history[2][64][64];
 extern int capture_history[12][64][6];
 extern int last_move_made[MAX_PLY];
 extern int lmr_table[MAX_PLY][64];
+extern int static_eval_stack[MAX_PLY];
+extern int excluded_move[MAX_PLY];
 
 // Timing
 extern long long start_time;
@@ -310,6 +319,7 @@ extern int multi_pv;
 extern int use_nnue_eval;
 extern int contempt;
 extern int use_book;
+extern int probcut_margin;
 
 // Constants
 extern char *start_position;

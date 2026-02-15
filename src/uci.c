@@ -22,6 +22,7 @@ extern int save_nnue(const char *filename);
 extern void init_nnue_random();
 extern int nnue_weights_loaded();
 extern void clear_tt();
+extern void resize_tt(int mb);
 extern long long get_time_ms();
 
 // ============================================ \\
@@ -140,6 +141,7 @@ void uci_loop()
                         hash_size_mb = 1;
                     if (hash_size_mb > 4096)
                         hash_size_mb = 4096;
+                    resize_tt(hash_size_mb);
                     printf("info string Hash set to %d MB\n", hash_size_mb);
                 }
             }
@@ -175,6 +177,7 @@ void uci_loop()
         {
             parse_position("position startpos");
             clear_tt();
+            tt_generation = 0;
             memset(killer_moves, 0, sizeof(killer_moves));
             memset(history_moves, 0, sizeof(history_moves));
             memset(counter_moves, 0, sizeof(counter_moves));
@@ -218,7 +221,8 @@ void uci_loop()
             if ((ptr = strstr(input, "depth")))
                 depth = atoi(ptr + 6);
 
-            int infinite = (strstr(input, "infinite") != NULL) || is_ponder;
+            int infinite = (strstr(input, "infinite") != NULL);
+            // Don't set infinite for ponder - we need to calculate time for ponderhit
 
             if ((ptr = strstr(input, "movestogo")))
                 movestogo = atoi(ptr + 10);
@@ -262,7 +266,8 @@ void uci_loop()
                 }
                 else
                 {
-                    expected_moves = 20 + phase;
+                    // Better move estimation
+                    expected_moves = 25 + phase / 2;
                     if (expected_moves > 50)
                         expected_moves = 50;
                     if (expected_moves < 15)
@@ -271,13 +276,16 @@ void uci_loop()
 
                 time_for_move = time / expected_moves;
                 if (inc > 0)
-                    time_for_move += inc * 4 / 5;
+                    time_for_move += inc * 3 / 4;
 
-                if (phase > 16)
-                    time_for_move = time_for_move * 11 / 10;
+                // Opening bonus: spend a bit more time in complex positions
+                if (phase > 18)
+                    time_for_move = time_for_move * 12 / 10;
 
                 long long max_time;
-                if (time > 60000)
+                if (time > 120000)
+                    max_time = time / 4;
+                else if (time > 60000)
                     max_time = time / 5;
                 else if (time > 10000)
                     max_time = time / 6;
@@ -289,11 +297,14 @@ void uci_loop()
                 if (time_for_move > max_time)
                     time_for_move = max_time;
 
+                // Safety margin
                 int safety = 30;
-                if (time < 3000)
-                    safety = 10;
-                if (time < 1000)
-                    safety = 5;
+                if (time < 5000)
+                    safety = 15;
+                if (time < 2000)
+                    safety = 8;
+                if (time < 500)
+                    safety = 3;
                 time_for_move -= safety;
 
                 if (time_for_move < 10)
@@ -302,6 +313,17 @@ void uci_loop()
             else
             {
                 time_for_move = -1; // Infinite
+            }
+
+            // For pondering: save calculated time for ponderhit, then set infinite
+            if (is_ponder)
+            {
+                ponder_time_for_move = time_for_move;
+                time_for_move = -1; // Infinite while pondering
+            }
+            else
+            {
+                ponder_time_for_move = -1;
             }
 
             if (depth == -1)
@@ -314,6 +336,7 @@ void uci_loop()
             times_up = 0;
             nodes = 0;
             best_move = 0; // Reset best move before search
+            memset(excluded_move, 0, sizeof(excluded_move));
 
             // Age history tables
             for (int i = 0; i < 12; i++)
@@ -334,7 +357,7 @@ void uci_loop()
 
             // Iterative deepening with aspiration windows
             int prev_score = 0;
-            int aspiration_window = 25;
+            int score_stability = 0; // Tracks how stable the score is across iterations
 
             for (int current_depth = 1; current_depth <= search_depth; current_depth++)
             {
@@ -342,33 +365,52 @@ void uci_loop()
                 if (times_up && current_depth > 1)
                     break;
 
-                int alpha, beta;
                 int score;
 
                 if (current_depth >= 5)
                 {
-                    alpha = prev_score - aspiration_window;
-                    beta = prev_score + aspiration_window;
+                    int delta = 25;
+                    int alpha = prev_score - delta;
+                    int beta = prev_score + delta;
 
-                    score = negamax(alpha, beta, current_depth, 0);
-
-                    if (!times_up && score <= alpha)
+                    // Aspiration window loop with exponentially growing windows
+                    while (1)
                     {
-                        alpha = prev_score - aspiration_window * 4;
                         if (alpha < -INF)
                             alpha = -INF;
-                        score = negamax(alpha, beta, current_depth, 0);
-                    }
-                    if (!times_up && score >= beta)
-                    {
-                        beta = prev_score + aspiration_window * 4;
                         if (beta > INF)
                             beta = INF;
+
                         score = negamax(alpha, beta, current_depth, 0);
-                    }
-                    if (!times_up && (score <= alpha || score >= beta))
-                    {
-                        score = negamax(-INF, INF, current_depth, 0);
+
+                        if (times_up)
+                            break;
+
+                        if (score <= alpha)
+                        {
+                            // Fail low - widen alpha
+                            beta = (alpha + beta) / 2;
+                            alpha = score - delta;
+                            delta += delta / 2 + 10;
+                        }
+                        else if (score >= beta)
+                        {
+                            // Fail high - widen beta
+                            beta = score + delta;
+                            delta += delta / 2 + 10;
+                        }
+                        else
+                        {
+                            // Score is within window
+                            break;
+                        }
+
+                        if (delta > 1000)
+                        {
+                            // Window too large, do full search
+                            score = negamax(-INF, INF, current_depth, 0);
+                            break;
+                        }
                     }
                 }
                 else
@@ -378,6 +420,15 @@ void uci_loop()
 
                 if (times_up)
                     break;
+
+                // Track score stability for time management
+                int score_diff = score - prev_score;
+                if (score_diff < 0)
+                    score_diff = -score_diff;
+                if (score_diff > 30)
+                    score_stability = 0; // Score changed significantly
+                else
+                    score_stability++;
 
                 prev_score = score;
 
@@ -410,8 +461,19 @@ void uci_loop()
                 {
                     if (score > MATE - 100 || score < -MATE + 100)
                         continue;
+
+                    // If score is stable, can stop earlier
+                    if (score_stability >= 3 && elapsed > time_for_move * 4 / 10 && current_depth >= 8)
+                        break;
+
+                    // Normal early exit
                     if (elapsed > time_for_move * 6 / 10 && current_depth >= 8)
                         break;
+
+                    // If score dropped significantly, allow more time
+                    if (score_diff > 50 && elapsed < time_for_move * 2)
+                        continue; // Keep searching
+
                     if (elapsed > time_for_move * 8 / 10)
                         break;
                 }
@@ -442,7 +504,7 @@ void uci_loop()
         }
         else if (strncmp(input, "uci", 3) == 0)
         {
-            printf("id name Fe64 v4.0 - The Boa Constrictor\n");
+            printf("id name Fe64 v4.3 - The Boa Constrictor\n");
             printf("id author Syed Masood\n");
             printf("option name Hash type spin default 64 min 1 max 4096\n");
             printf("option name Contempt type spin default 10 min -100 max 100\n");

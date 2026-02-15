@@ -1409,11 +1409,86 @@ book             - Show book info
 
 ## Document History
 
-| Version | Date     | Changes                      |
-| ------- | -------- | ---------------------------- |
-| 4.0.0   | Jan 2026 | Initial professional version |
+| Version | Date     | Changes                                             |
+| ------- | -------- | --------------------------------------------------- |
+| 4.0.0   | Jan 2026 | Initial professional version                        |
+| 4.1.0   | Feb 2026 | Major search & eval improvements (see below)        |
+| 4.2.0   | Feb 2026 | Singular extensions, better aspiration, king safety |
+
+### v4.2.0 Changelog
+
+**Search Improvements:**
+
+- Singular Extensions: When the TT move appears much better than all alternatives (verified by a reduced-depth search excluding the TT move), extend its search by 1 ply. Also includes multi-cut pruning when the verification search exceeds beta. Requires depth >= 8, TT depth >= depth-3. Estimated +30-50 ELO.
+- Aspiration Windows Loop: Replaced linear re-search with proper exponentially-growing window loop. On fail-low, widens alpha; on fail-high, widens beta. Falls back to full window search after delta exceeds 1000. Estimated +5-10 ELO.
+- History Pruning: Prune quiet moves with very negative history scores (< -1024 \* depth) at depth <= 4. Estimated +10-15 ELO.
+- SEE Pruning for Quiet Moves: Prune quiet moves that lose material when searched beyond move 3, at depth <= 6. Estimated +5-10 ELO.
+- LMR for Captures: Apply reduced-depth search to losing captures (negative SEE) at moves >= 5 and depth >= 5. Estimated +5 ELO.
+- History-based LMR Adjustment: Reduce less for moves with good history, more for bad history, using continuous scaling (hist/5000). More aggressive reductions for high move count (>12) and complex middlegame positions.
+- Score Stability Time Management: Track score stability across iterations. When score is stable (3+ iterations unchanged), allow earlier cutoff. When score drops >50cp, extend time to search deeper.
+
+**Evaluation Improvements:**
+
+- King Safety Zone: Complete rewrite of `count_king_attackers()` to evaluate the full king zone (king square + all adjacent squares) instead of just the king square. Tracks piece-type-specific attack weights (N=25, B=25, R=50, Q=100) and applies quadratic scaling for multiple attackers. Phase-scaled so king safety matters more in the middlegame.
+
+**NNUE Improvements:**
+
+- Fixed critical float64/float32 dtype bug: Weight matrices were promoted to float64 during initialization (`float32 * float64_scalar → float64`), causing the C engine to read corrupted values. This made evaluate_nnue() return INT_MIN (-2147483648).
+- Retrained NNUE with Stockfish 14.1 depth-12 evaluations instead of game results, for much higher quality position labels.
+- Improved training: 40% position sampling rate (up from 20%), depth-12 Stockfish analysis (up from 10), more training data.
+
+### v4.1.0 Changelog
+
+**Critical Bug Fixes:**
+
+- Fixed hash_key not preserved in copy_board/take_back macros. This completely broke the transposition table, as every take_back() left hash_key in a corrupted state, causing incorrect TT lookups throughout the entire search tree. This single fix is estimated at 100-200 ELO.
+- Fixed SEE variable shadowing: `for (int p = (side == white) ? p : P; ...)` used `p` as both loop variable and enum reference. Renamed to `pp` with explicit start/end piece variables for safety.
+- Enabled pondering in lichess-bot config (was disabled despite engine support).
+
+**Search Improvements:**
+
+- Internal Iterative Deepening (IID): When no TT move exists at depth >= 5, do a reduced search first to find a good move to try first. Estimated +10-15 ELO.
+- Mate Distance Pruning: If we already found a mate closer to root, prune branches that can't improve. Estimated +5-10 ELO.
+- Improving Detection: Track static eval at each ply. When position is improving (current eval > eval from 2 plies ago), be less aggressive with pruning (reduce LMP margins, futility margins, and LMR reductions). Estimated +15-25 ELO.
+- Adaptive Null Move Pruning: R = 3 + depth/3 + (depth > 6 ? 1 : 0), require non_pawn_material > 1, don't return unproven mate scores.
+- Single evaluate() call per node: Reuse static eval for razoring, reverse futility, and move-level futility instead of calling evaluate() multiple times.
+- Improved LMR formula: 0.5 + log(depth) \* log(moves) / 2.5 with improving-aware reduction adjustments.
+
+**Evaluation Improvements:**
+
+- Applied doubled pawn penalty (12cp) - constant existed but was never used!
+- Applied isolated pawn penalty (22cp) - constant existed but was never used!
+- Added backward pawn penalty (15cp)
+- Added connected rooks bonus (18cp)
+- Added protected passed pawn bonus (15cp)
+- Added king proximity bonus for passed pawns in endgames (8cp per distance difference)
+- Stockfish-inspired Piece-Square Tables for all pieces
+- Updated material values: N=337, B=365, R=477, Q=1025 (tuned to Stockfish)
+- Improved evaluation constants: bishop_pair=55, rook_open_file=30, knight_outpost=30
+
+**Opening Books:**
+
+- Integrated gm2600.bin: 1.5MB professional-level Polyglot book with GM-level openings
+- Built custom_book.bin: 75,154 entries from 10,604 games (Zhigalko, PenguinGM1, Magnus Carlsen)
+- Book building tool: scripts/build_book.py for creating custom Polyglot books from PGN
+
+**NNUE Training Infrastructure:**
+
+- Created training/train_nnue.py: Full NNUE training pipeline
+- Architecture: 768 (12 pieces × 64 squares) → 256 (CReLU) → 32 (CReLU) → 1
+- Scale factor: 400 centipawns
+- Vectorized backpropagation using numpy broadcasting
+- Trains from PGN databases with engine evaluation labels
+
+**Infrastructure:**
+
+- MAX_PLY increased from 64 to 128
+- MAX_GAME_MOVES increased from 1024 to 2048
+- history_max doubled to 32768 for better move ordering
+- Hash table default increased to 512MB for lichess-bot
+- Improved time management with better expected moves formula
 
 ---
 
-_Document generated for Fe64 Chess Engine v4.0.0_  
+_Document generated for Fe64 Chess Engine v4.2.0_  
 _"The Boa Constrictor" - Slow Death Style_
