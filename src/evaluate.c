@@ -485,6 +485,121 @@ int is_passed_pawn(int square, int color)
 }
 
 // ============================================ \\
+//       CONSTRICTOR PRESSURE EVALUATION        \\
+// ============================================ \\
+
+int has_insufficient_mating_material()
+{
+    int white_minors = count_bits(bitboards[N] | bitboards[B]);
+    int black_minors = count_bits(bitboards[n] | bitboards[b]);
+    int white_heavy_or_pawns = count_bits(bitboards[P] | bitboards[R] | bitboards[Q]);
+    int black_heavy_or_pawns = count_bits(bitboards[p] | bitboards[r] | bitboards[q]);
+
+    if (white_heavy_or_pawns || black_heavy_or_pawns)
+        return 0;
+
+    // K vs K, K+N vs K, K+B vs K, and symmetric bare-minor cases are dead
+    // draws in practical play. Returning 0 keeps the engine from flagging
+    // itself while trying to squeeze a position that cannot be won.
+    return white_minors <= 1 && black_minors <= 1;
+}
+
+static U64 attacks_by_color(int color)
+{
+    U64 attacks = 0ULL;
+    U64 pieces;
+
+    pieces = (color == white) ? bitboards[P] : bitboards[p];
+    while (pieces)
+    {
+        int sq = get_ls1b_index(pieces);
+        attacks |= pawn_attacks[color][sq];
+        pop_bit(pieces, sq);
+    }
+
+    pieces = (color == white) ? bitboards[N] : bitboards[n];
+    while (pieces)
+    {
+        int sq = get_ls1b_index(pieces);
+        attacks |= knight_attacks[sq];
+        pop_bit(pieces, sq);
+    }
+
+    pieces = (color == white) ? bitboards[B] : bitboards[b];
+    while (pieces)
+    {
+        int sq = get_ls1b_index(pieces);
+        attacks |= get_bishop_attacks_magic(sq, occupancies[both]);
+        pop_bit(pieces, sq);
+    }
+
+    pieces = (color == white) ? bitboards[R] : bitboards[r];
+    while (pieces)
+    {
+        int sq = get_ls1b_index(pieces);
+        attacks |= get_rook_attacks_magic(sq, occupancies[both]);
+        pop_bit(pieces, sq);
+    }
+
+    pieces = (color == white) ? bitboards[Q] : bitboards[q];
+    while (pieces)
+    {
+        int sq = get_ls1b_index(pieces);
+        attacks |= get_queen_attacks(sq, occupancies[both]);
+        pop_bit(pieces, sq);
+    }
+
+    pieces = (color == white) ? bitboards[K] : bitboards[k];
+    if (pieces)
+        attacks |= king_attacks[get_ls1b_index(pieces)];
+
+    return attacks;
+}
+
+int calculate_constrictor_pressure(int color)
+{
+    int enemy = color ^ 1;
+    int enemy_king = (enemy == white) ? get_ls1b_index(bitboards[K]) : get_ls1b_index(bitboards[k]);
+    if (enemy_king == -1)
+        return 0;
+
+    U64 our_attacks = attacks_by_color(color);
+    U64 enemy_attacks = attacks_by_color(enemy);
+    U64 enemy_pieces = occupancies[enemy];
+    int pressure = 0;
+
+    // Boa Constrictor idea: a quiet squeeze is strongest when the enemy king
+    // and pieces lose safe squares. Reward controlled king-zone squares that
+    // are not defended by the opponent, rather than only direct checks.
+    U64 king_zone = king_attacks[enemy_king] | (1ULL << enemy_king);
+    U64 dominated_king_zone = king_zone & our_attacks & ~enemy_attacks;
+    pressure += count_bits(dominated_king_zone) * 14;
+
+    U64 minors = (enemy == white) ? (bitboards[N] | bitboards[B]) : (bitboards[n] | bitboards[b]);
+    while (minors)
+    {
+        int sq = get_ls1b_index(minors);
+        int mobility = count_bits((knight_attacks[sq] | get_bishop_attacks_magic(sq, occupancies[both])) & ~enemy_pieces);
+        if (mobility <= 3)
+            pressure += (4 - mobility) * 9;
+        pop_bit(minors, sq);
+    }
+
+    // Clamp advanced enemy pawns and reward blockades in front of passers.
+    U64 pawns = (enemy == white) ? bitboards[P] : bitboards[p];
+    while (pawns)
+    {
+        int sq = get_ls1b_index(pawns);
+        int front = (enemy == white) ? sq - 8 : sq + 8;
+        if (front >= 0 && front < 64 && (our_attacks & (1ULL << front)))
+            pressure += 5;
+        pop_bit(pawns, sq);
+    }
+
+    return pressure;
+}
+
+// ============================================ \\
 //           MAIN EVALUATION FUNCTION           \\
 // ============================================ \\
 
@@ -495,6 +610,9 @@ int evaluate()
     {
         return evaluate_nnue();
     }
+
+    if (has_insufficient_mating_material())
+        return 0;
 
     int score = 0;
     U64 bitboard;
@@ -541,6 +659,11 @@ int evaluate()
 
     score += calculate_king_tropism(white);
     score -= calculate_king_tropism(black);
+
+    // New Constrictor Pressure Map: value the slow denial of safe squares,
+    // maintaining Fe64's identity as a boa-constrictor positional engine.
+    score += calculate_constrictor_pressure(white);
+    score -= calculate_constrictor_pressure(black);
 
     // Trade bonus when ahead
     int material_imbalance = 0;

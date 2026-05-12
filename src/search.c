@@ -23,6 +23,7 @@ extern void write_tt(int depth, int score, int flag, int best_move, int ply);
 extern int get_tt_move();
 extern int get_tt_score_raw(int ply, int *tt_depth_out, int *tt_flags_out);
 extern int is_repetition();
+extern int square_distance(int sq1, int sq2);
 
 // MVV-LVA (Most Valuable Victim - Least Valuable Attacker) scores
 // [attacker][victim] - higher score = better capture
@@ -300,6 +301,50 @@ int see_ge(int move, int threshold)
 //              MOVE SCORING                    \\
 // ============================================ \\
 
+// Constrictor move-order bonus: prefer quiet moves that increase long-term
+// spatial pressure instead of only looking for immediate tactics. This is not
+// a replacement for alpha-beta; it simply lets the search examine Boa-style
+// clamps and outposts earlier, which makes cutoffs more relevant to Fe64's
+// intended personality.
+static int constrictor_move_bonus(int move)
+{
+    if (get_move_capture(move) || get_move_promoted(move))
+        return 0;
+
+    int piece = get_move_piece(move);
+    int to = get_move_target(move);
+    int rank = to / 8;
+    int file = to % 8;
+    int bonus = 0;
+
+    if (file >= 2 && file <= 5)
+        bonus += 8; // central clamps restrict more enemy moves
+
+    if ((side == white && rank <= 3) || (side == black && rank >= 4))
+        bonus += 10; // occupy enemy half
+
+    if (piece == P || piece == p)
+    {
+        if ((piece == P && rank <= 3) || (piece == p && rank >= 4))
+            bonus += 18; // advanced pawn lever / space grab
+        if (file > 0 && file < 7)
+            bonus += 4;
+    }
+    else if (piece == N || piece == n || piece == B || piece == b)
+    {
+        U64 enemy_pawns = (side == white) ? bitboards[p] : bitboards[P];
+        U64 pawn_chasers = (side == white) ? pawn_attacks[white][to] : pawn_attacks[black][to];
+        if (!(pawn_chasers & enemy_pawns))
+            bonus += 14; // durable outpost candidate
+    }
+
+    int enemy_king = (side == white) ? get_ls1b_index(bitboards[k]) : get_ls1b_index(bitboards[K]);
+    if (enemy_king != -1 && square_distance(to, enemy_king) <= 3)
+        bonus += 10; // tighten the vise around the king
+
+    return bonus;
+}
+
 int score_move(int move, int pv_move, int ply)
 {
     // PV move from TT
@@ -363,7 +408,7 @@ int score_move(int move, int pv_move, int ply)
     int to = get_move_target(move);
     int bfly = butterfly_history[side][from][to];
 
-    return hist + bfly / 2;
+    return hist + bfly / 2 + constrictor_move_bonus(move);
 }
 
 // ============================================ \\

@@ -304,6 +304,8 @@ extern long long start_time;
 extern long long stop_time;
 extern long long time_for_move;
 extern int times_up;
+extern volatile int quit_received;
+extern void restore_stdin_blocking();
 
 // Pondering
 extern volatile int pondering;
@@ -312,6 +314,7 @@ extern int ponder_move;
 extern int ponder_hit;
 extern long long ponder_time_for_move;
 extern pthread_mutex_t search_mutex;
+extern int allow_ponder;
 
 // UCI Options
 extern int hash_size_mb;

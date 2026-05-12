@@ -281,50 +281,118 @@ U64 get_polyglot_key()
 //           BOOK LOADING & LOOKUP              \\
 // ============================================ \\
 
-int load_opening_book(const char *filename)
+
+static int compare_book_entries(const void *a, const void *b)
+{
+    const PolyglotEntry *ea = (const PolyglotEntry *)a;
+    const PolyglotEntry *eb = (const PolyglotEntry *)b;
+    if (ea->key < eb->key)
+        return -1;
+    if (ea->key > eb->key)
+        return 1;
+    return eb->weight - ea->weight;
+}
+
+static int append_opening_book(const char *filename)
 {
     FILE *f = fopen(filename, "rb");
     if (!f)
-    {
-        printf("info string Opening book not found: %s\n", filename);
         return 0;
-    }
 
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
-
-    book_entries = size / 16;
-    if (book_entries > BOOK_MAX_ENTRIES)
-        book_entries = BOOK_MAX_ENTRIES;
-
-    opening_book = (PolyglotEntry *)malloc(book_entries * sizeof(PolyglotEntry));
-    if (!opening_book)
+    if (size <= 0)
     {
         fclose(f);
         return 0;
     }
 
-    // Read big-endian entries
-    for (int i = 0; i < book_entries; i++)
+    int new_entries = size / 16;
+    if (book_entries + new_entries > BOOK_MAX_ENTRIES)
+        new_entries = BOOK_MAX_ENTRIES - book_entries;
+    if (new_entries <= 0)
+    {
+        fclose(f);
+        return 0;
+    }
+
+    PolyglotEntry *grown = (PolyglotEntry *)realloc(opening_book, (book_entries + new_entries) * sizeof(PolyglotEntry));
+    if (!grown)
+    {
+        fclose(f);
+        return 0;
+    }
+    opening_book = grown;
+
+    int loaded = 0;
+    for (int i = 0; i < new_entries; i++)
     {
         unsigned char data[16];
         if (fread(data, 1, 16, f) != 16)
             break;
 
-        opening_book[i].key = ((U64)data[0] << 56) | ((U64)data[1] << 48) |
-                              ((U64)data[2] << 40) | ((U64)data[3] << 32) |
-                              ((U64)data[4] << 24) | ((U64)data[5] << 16) |
-                              ((U64)data[6] << 8) | (U64)data[7];
-        opening_book[i].move = (data[8] << 8) | data[9];
-        opening_book[i].weight = (data[10] << 8) | data[11];
-        opening_book[i].learn = (data[12] << 24) | (data[13] << 16) |
-                                (data[14] << 8) | data[15];
+        opening_book[book_entries + loaded].key = ((U64)data[0] << 56) | ((U64)data[1] << 48) |
+                                                 ((U64)data[2] << 40) | ((U64)data[3] << 32) |
+                                                 ((U64)data[4] << 24) | ((U64)data[5] << 16) |
+                                                 ((U64)data[6] << 8) | (U64)data[7];
+        opening_book[book_entries + loaded].move = (data[8] << 8) | data[9];
+        opening_book[book_entries + loaded].weight = (data[10] << 8) | data[11];
+        opening_book[book_entries + loaded].learn = (data[12] << 24) | (data[13] << 16) |
+                                                   (data[14] << 8) | data[15];
+        loaded++;
     }
 
     fclose(f);
-    printf("info string Loaded %d book entries from %s\n", book_entries, filename);
+    book_entries += loaded;
+    printf("info string Loaded %d book entries from %s\n", loaded, filename);
+    return loaded > 0;
+}
+
+int load_opening_book(const char *filename)
+{
+    if (opening_book)
+    {
+        free(opening_book);
+        opening_book = NULL;
+    }
+    book_entries = 0;
+
+    if (!append_opening_book(filename))
+    {
+        printf("info string Opening book not found: %s\n", filename);
+        return 0;
+    }
+
+    qsort(opening_book, book_entries, sizeof(PolyglotEntry), compare_book_entries);
     return 1;
+}
+
+int load_opening_books_from_paths(const char **filenames, int count)
+{
+    if (opening_book)
+    {
+        free(opening_book);
+        opening_book = NULL;
+    }
+    book_entries = 0;
+
+    int loaded_books = 0;
+    for (int i = 0; i < count; i++)
+    {
+        if (filenames[i] && append_opening_book(filenames[i]))
+            loaded_books++;
+    }
+
+    if (book_entries > 0)
+    {
+        qsort(opening_book, book_entries, sizeof(PolyglotEntry), compare_book_entries);
+        printf("info string Aggregated %d entries from %d opening books\n", book_entries, loaded_books);
+        return 1;
+    }
+
+    printf("info string No opening books loaded\n");
+    return 0;
 }
 
 int find_book_entry(U64 key)

@@ -62,6 +62,7 @@ long long start_time;
 long long stop_time;
 long long time_for_move;
 int times_up = 0;
+volatile int quit_received = 0;
 
 // Pondering
 volatile int pondering = 0;
@@ -70,6 +71,7 @@ int ponder_move = 0;
 int ponder_hit = 0;
 long long ponder_time_for_move = -1;
 pthread_mutex_t search_mutex = PTHREAD_MUTEX_INITIALIZER;
+int allow_ponder = 1;
 
 // UCI Options
 int hash_size_mb = 64;
@@ -451,7 +453,8 @@ static char input_buffer[256];
 static int input_buffer_pos = 0;
 static int stdin_nonblocking_set = 0;
 
-// Set stdin to non-blocking mode
+// Set stdin to non-blocking mode while the search is running so
+// communicate() can react to stop/ponderhit without a helper thread.
 void set_stdin_nonblocking()
 {
 #ifndef _WIN32
@@ -460,6 +463,22 @@ void set_stdin_nonblocking()
         int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
         fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
         stdin_nonblocking_set = 1;
+    }
+#endif
+}
+
+// Restore blocking stdin before returning to the outer UCI fgets() loop.
+// Leaving O_NONBLOCK enabled caused the protocol loop to spin after ponder
+// searches and could starve lichess-bot long enough to lose on time.
+void restore_stdin_blocking()
+{
+#ifndef _WIN32
+    if (stdin_nonblocking_set)
+    {
+        int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+        if (flags != -1)
+            fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK);
+        stdin_nonblocking_set = 0;
     }
 #endif
 }
@@ -565,6 +584,7 @@ void communicate()
         // EOF - stdin closed, stop engine
         times_up = 1;
         stop_pondering = 1;
+        quit_received = 1;
         return;
     }
     if (result == 1)
@@ -579,11 +599,19 @@ void communicate()
         {
             times_up = 1;
             stop_pondering = 1;
+            quit_received = 1;
             return;
         }
         else if (strncmp(input, "ponderhit", 9) == 0)
         {
             ponder_hit = 1;
+        }
+        else if (strncmp(input, "isready", 7) == 0)
+        {
+            // UCI allows readiness probes at awkward times. Acknowledge the
+            // command immediately and keep searching unless a stop follows.
+            printf("readyok\n");
+            fflush(stdout);
         }
     }
 

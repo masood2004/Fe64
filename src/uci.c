@@ -42,7 +42,7 @@ void uci_loop()
         fflush(stdout);
 
         if (!fgets(input, 2000, stdin))
-            continue;
+            break;
         if (input[0] == '\n')
             continue;
 
@@ -167,6 +167,11 @@ void uci_loop()
                     printf("info string MultiPV set to %d\n", multi_pv);
                 }
             }
+            else if (strstr(input, "Ponder"))
+            {
+                allow_ponder = (strstr(input, "true") != NULL);
+                printf("info string Ponder %s\n", allow_ponder ? "enabled" : "disabled");
+            }
             continue;
         }
         else if (strncmp(input, "position", 8) == 0)
@@ -191,7 +196,7 @@ void uci_loop()
             ponder_hit = 0;
             times_up = 0;
 
-            int is_ponder = (strstr(input, "ponder") != NULL);
+            int is_ponder = allow_ponder && (strstr(input, "ponder") != NULL);
             pondering = is_ponder;
 
             // Check opening book first (not when pondering)
@@ -353,7 +358,7 @@ void uci_loop()
                     for (int k = 0; k < 64; k++)
                         butterfly_history[i][j][k] /= 2;
 
-            printf("info string Time allocated: %lld ms\n", time_for_move);
+            printf("info string Time allocated: %lld ms%s\n", time_for_move, is_ponder ? " (pondering until ponderhit/stop)" : "");
 
             // Iterative deepening with aspiration windows
             int prev_score = 0;
@@ -479,7 +484,9 @@ void uci_loop()
                 }
             }
 
-            // Output best move
+            // Output best move. Restore blocking stdin first because communicate()
+            // temporarily enables non-blocking reads during search.
+            restore_stdin_blocking();
             pondering = 0;
             printf("bestmove ");
             if (best_move)
@@ -487,7 +494,7 @@ void uci_loop()
             else
                 printf("0000");
 
-            if (pv_length[0] >= 2 && pv_table[0][1])
+            if (allow_ponder && pv_length[0] >= 2 && pv_table[0][1])
             {
                 printf(" ponder ");
                 print_move(pv_table[0][1]);
@@ -495,6 +502,8 @@ void uci_loop()
             }
             printf("\n");
             fflush(stdout);
+            if (quit_received)
+                break;
         }
         else if (strncmp(input, "quit", 4) == 0)
         {
@@ -504,7 +513,7 @@ void uci_loop()
         }
         else if (strncmp(input, "uci", 3) == 0)
         {
-            printf("id name Fe64 v4.3 - The Boa Constrictor\n");
+            printf("id name Fe64 v4.4 - The Boa Constrictor\n");
             printf("id author Syed Masood\n");
             printf("option name Hash type spin default 64 min 1 max 4096\n");
             printf("option name Contempt type spin default 10 min -100 max 100\n");

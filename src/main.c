@@ -19,6 +19,7 @@ extern void init_tt(int mb);
 
 // External function declarations - Opening Book
 extern int load_opening_book(const char *filename);
+extern int load_opening_books_from_paths(const char **filenames, int count);
 
 // External function declarations - NNUE
 extern int load_nnue(const char *filename);
@@ -62,8 +63,17 @@ int main(int argc, char *argv[])
 
     repetition_index = 0;
 
-    // Try to load opening book from default location
-    load_opening_book("book.bin");
+    // Try to load the strongest bundled Polyglot books. Keeping several
+    // curated books available gives Fe64 broader opening knowledge while
+    // still using its own search/evaluation once the book ends.
+    const char *default_books[] = {
+        "book.bin",
+        "bin/book.bin",
+        "bin/performance.bin",
+        "bin/gm2600.bin",
+        "bin/rebel.bin",
+        "bin/custom_book.bin"};
+    load_opening_books_from_paths(default_books, sizeof(default_books) / sizeof(default_books[0]));
 
     // Try to load NNUE if available
     if (NNUE_ENABLED)
