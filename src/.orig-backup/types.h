@@ -9,19 +9,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <errno.h>
 #include <sys/time.h>
 #include <math.h>
 #include <pthread.h>
 
 // Platform-specific includes for non-blocking input
 #ifdef _WIN32
-// MinGW-w64 provides windows.h/conio.h/io.h and its own sys/time.h
-// (with gettimeofday), so no POSIX select()/fcntl() layer is needed.
 #include <windows.h>
 #include <conio.h>
-#include <io.h>
-#include <process.h>
 #else
 #include <unistd.h>
 #include <sys/select.h>

@@ -40,29 +40,8 @@ SOURCES = main.c \
 # Object files
 OBJECTS = $(patsubst %.c,$(OBJ_DIR)/%.o,$(SOURCES))
 
-# Build configuration
-#   make          -> ../bin/fe64         (release, POSIX/Linux)
-#   make win      -> ../bin/fe64.exe     (release, native Windows/MinGW)
-#   make win-cross-> ../bin/fe64.exe     (cross-compile from Linux)
-BUILD ?= release
-ifeq ($(BUILD),win)
-OBJ_DIR = obj_win
-TARGET = $(BIN_DIR)/fe64.exe
-OBJECTS = $(patsubst %.c,$(OBJ_DIR)/%.o,$(SOURCES))
-CFLAGS += -O3 -DNDEBUG -static
-LIBS = -static -lpthread -lm
-endif
-ifeq ($(BUILD),win-cross)
-OBJ_DIR = obj_win
-TARGET = $(BIN_DIR)/fe64.exe
-OBJECTS = $(patsubst %.c,$(OBJ_DIR)/%.o,$(SOURCES))
-CC = x86_64-w64-mingw32-gcc
-CFLAGS += -O3 -DNDEBUG -static
-LIBS = -static -lpthread
-endif
-
 # Output executable
-TARGET ?= $(BIN_DIR)/fe64
+TARGET = $(BIN_DIR)/fe64
 
 # Header dependencies
 HEADERS = types.h
@@ -71,7 +50,7 @@ HEADERS = types.h
 #          BUILD TARGETS
 # ============================================
 
-.PHONY: all release fast debug clean test bench info win64 perft win win-cross
+.PHONY: all release fast debug clean test bench info win64 perft
 
 # Default target
 all: release
@@ -79,14 +58,6 @@ all: release
 # Release build (optimized)
 release: CFLAGS += $(RELEASE_FLAGS)
 release: $(TARGET)
-
-# Native Windows build (run from a w64devkit / MSYS2 shell: make win)
-win: BUILD = win
-win: $(TARGET)
-
-# Windows cross-compile from Linux
-win-cross: BUILD = win-cross
-win-cross: $(TARGET)
 
 # Fast build (maximum optimization for local CPU)
 fast: CFLAGS += -O3 -DNDEBUG -flto -march=native -mtune=native -funroll-loops
@@ -129,7 +100,7 @@ $(TARGET): $(OBJECTS)
 	@echo "  ██║     ███████╗╚██████╔╝     ██║"
 	@echo "  ╚═╝     ╚══════╝ ╚═════╝      ╚═╝"
 	@echo ""
-	@echo "  Built $(BIN_DIR)/fe64 successfully!"
+	@echo "  Built $(TARGET) successfully!"
 	@echo "  \"The Boa Constrictor\" - Modular Build"
 	@echo "  Source files: $(words $(SOURCES))"
 	@echo ""
@@ -140,8 +111,10 @@ $(TARGET): $(OBJECTS)
 
 # Clean build artifacts
 clean:
-	@rm -rf obj obj_win
-	@rm -f $(BIN_DIR)/fe64 $(BIN_DIR)/fe64.exe
+	rm -rf $(OBJ_DIR)
+	rm -f $(TARGET)
+	rm -f $(TARGET).exe
+	rm -f $(BIN_DIR)/fe64_32.exe
 	@echo "Cleaned build artifacts"
 
 # Show source file info
@@ -152,8 +125,12 @@ info:
 	@echo "Header files:"
 	@for hdr in $(HEADERS); do echo "  - $$hdr"; done
 
-# Windows 64-bit cross-compile from Linux (alias for `make win-cross`)
-win64: win-cross
+# Windows 64-bit (cross-compile from Linux)
+win64: CC = x86_64-w64-mingw32-gcc
+win64: CFLAGS += -O3 -DNDEBUG -static
+win64: LIBS = -static -lpthread
+win64: TARGET = $(BIN_DIR)/fe64.exe
+win64: $(TARGET)
 
 # ============================================
 #          TESTING

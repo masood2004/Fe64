@@ -452,7 +452,6 @@ long long get_time_ms()
 static char input_buffer[256];
 static int input_buffer_pos = 0;
 static int stdin_nonblocking_set = 0;
-static int stdin_at_eof = 0;
 
 // Set stdin to non-blocking mode while the search is running so
 // communicate() can react to stop/ponderhit without a helper thread.
@@ -486,34 +485,19 @@ void restore_stdin_blocking()
 
 int input_waiting()
 {
-    // Returns the number of bytes already available on stdin.
-    // On Windows this works for both a console and a redirected pipe,
-    // unlike _kbhit(), which only inspects the console keyboard buffer.
-    if (stdin_at_eof)
-        return 1;
-
 #ifdef _WIN32
-    HANDLE h = (HANDLE)_get_osfhandle(STDIN_FILENO);
-    if (h == INVALID_HANDLE_VALUE)
-        return 0;
-
-    DWORD type = GetFileType(h);
-    if (type == FILE_TYPE_PIPE)
+    static int init = 0;
+    static HANDLE h;
+    DWORD mode;
+    if (!init)
     {
-        DWORD available = 0;
-        if (PeekNamedPipe(h, NULL, 0, NULL, &available, NULL))
-            return available > 0;
-        // The pipe was broken: treat it as end of input.
-        return 1;
+        init = 1;
+        h = GetStdHandle(STD_INPUT_HANDLE);
+        GetConsoleMode(h, &mode);
+        SetConsoleMode(h, mode & ~(ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT));
+        FlushConsoleInputBuffer(h);
     }
-
-    if (type == FILE_TYPE_CHAR)
-        return _kbhit();
-
-    if (type == FILE_TYPE_DISK)
-        return 1; // Regular file: reads do not block.
-
-    return 0;
+    return _kbhit();
 #else
     fd_set readfds;
     struct timeval tv;
@@ -525,35 +509,6 @@ int input_waiting()
 #endif
 }
 
-// Read a single byte from stdin without blocking.
-// Returns the byte, -1 when no data is available, or -2 on EOF.
-static int read_byte_nonblocking()
-{
-#ifdef _WIN32
-    // _read() on an anonymous pipe returns as soon as any data is present
-    // and only blocks when the pipe is empty, which input_waiting() rules out.
-    unsigned char c;
-    int n = _read(STDIN_FILENO, &c, 1);
-    if (n == 0)
-        return -2;
-    if (n < 0)
-    {
-        if (errno == EINTR)
-            return -1;
-        return -2; // Broken pipe / invalid handle: treat as EOF.
-    }
-    return (int)c;
-#else
-    unsigned char c;
-    ssize_t n = read(STDIN_FILENO, &c, 1);
-    if (n == 0)
-        return -2;
-    if (n < 0)
-        return -1; // EAGAIN / EWOULDBLOCK
-    return (int)c;
-#endif
-}
-
 // Non-blocking read of a complete line
 // Returns 1 if a complete line was read, 0 otherwise
 // Returns -1 on EOF (stdin closed)
@@ -562,25 +517,23 @@ int read_line_nonblocking(char *output, int max_len)
     // Ensure stdin is non-blocking
     set_stdin_nonblocking();
 
-    if (!input_waiting())
-        return 0;
-
     // Try to read available characters
+    char c;
     while (1)
     {
-        int byte = read_byte_nonblocking();
+        ssize_t bytes_read = read(STDIN_FILENO, &c, 1);
 
-        if (byte == -1)
-            break; // No more data available right now.
-
-        if (byte == -2)
+        if (bytes_read == 0)
         {
             // EOF - stdin closed, engine should stop
-            stdin_at_eof = 1;
             return -1;
         }
 
-        char c = (char)byte;
+        if (bytes_read < 0)
+        {
+            // No more data available (EAGAIN/EWOULDBLOCK)
+            break;
+        }
 
         if (c == '\n' || c == '\r')
         {
